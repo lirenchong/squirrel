@@ -188,7 +188,7 @@ final class SquirrelPanel: NSPanel {
     } else {
       restore.isEnabled = false
       restore.title += "（读取失败）"
-      submenu.addItem(withTitle: "无法读取恢复列表：\(controller.candidateRestorationResult)", action: nil, keyEquivalent: "").isEnabled = false
+      submenu.addItem(withTitle: "无法读取恢复列表：\(candidateFailureDescription(controller.candidateRestorationResult))", action: nil, keyEquivalent: "").isEnabled = false
       presentCandidateRestorationResult(controller.candidateRestorationResult)
     }
     return menu
@@ -204,29 +204,35 @@ final class SquirrelPanel: NSPanel {
     inputController?.restoreCandidate(target)
   }
 
-  func presentCandidateRestorationResult(_ result: String) {
+  private func candidateFailureDescription(_ result: String) -> String {
     switch result {
-    case "ok": candidateDeletionMessage = "已恢复所选候选"
-    case "stale_target": candidateDeletionMessage = "未恢复：候选或菜单已变化，请重新右击"
-    case "storage_write_failed", "storage_replace_failed": candidateDeletionMessage = "未恢复：持久存储写入失败"
-    case "invalid_action": candidateDeletionMessage = "未恢复：当前后端不支持列表读取"
-    case "invalid_payload": candidateDeletionMessage = "未恢复：恢复列表不完整或格式无效"
-    case "unavailable", "incompatible_runtime": candidateDeletionMessage = "未恢复：当前运行库或方案不支持"
-    default: candidateDeletionMessage = "未恢复：\(result)"
+    case "stale_target": return "候选或菜单已变化，请重新右击"
+    case "storage_write_failed", "storage_replace_failed": return "持久存储写入失败"
+    case "storage_read_failed": return "持久存储读取失败"
+    case "storage_invalid": return "持久存储格式异常"
+    case "invalid_action": return "当前后端不支持列表读取"
+    case "invalid_payload": return "恢复列表不完整或格式无效"
+    case "unavailable", "incompatible_runtime": return "当前运行库或方案不支持"
+    case "unsupported_dictionary": return "此词典不支持持久身份提取"
+    case "rc_missing_reading": return "候选缺少完整读音"
+    case "rc_generation_read_failed": return "候选读音世代读取失败"
+    case "rc_invalid_generation", "rc_generation_invalid": return "候选读音世代格式异常"
+    case "rc_owner_mismatch", "rc_not_user_table", "rc_missing_custom_code", "rc_missing_row": return "候选读音来源不匹配"
+    case "rc_wrong_db_class": return "当前方案的候选读音配置不支持"
+    case "highlight_failed": return "无法定位目标候选"
+    case "not_found": return "持久记录已变化，请重新右击"
+    default: return "操作未获确认"
     }
+  }
+
+  func presentCandidateRestorationResult(_ result: String) {
+    candidateDeletionMessage = result == "ok" ? "已恢复所选候选" : "未恢复：\(candidateFailureDescription(result))"
     update(preedit: preedit, selRange: selRange, caretPos: caretPos, candidates: candidates,
            comments: comments, labels: labels, highlighted: index, page: page, lastPage: lastPage, update: false)
   }
 
   func presentCandidateDeletionResult(_ result: String) {
-    switch result {
-    case "ok": candidateDeletionMessage = ""
-    case "unsupported_dictionary": candidateDeletionMessage = "未删除：此词典不支持持久身份提取"
-    case "stale_target": candidateDeletionMessage = "未删除：候选已变化，请重新右击"
-    case "storage_write_failed", "storage_replace_failed": candidateDeletionMessage = "未删除：持久存储写入失败"
-    case "unavailable", "incompatible_runtime": candidateDeletionMessage = "未删除：当前运行库或方案不支持"
-    default: candidateDeletionMessage = "未删除：\(result)"
-    }
+    candidateDeletionMessage = result == "ok" ? "" : "未删除：\(candidateFailureDescription(result))"
     update(preedit: preedit, selRange: selRange, caretPos: caretPos, candidates: candidates,
            comments: comments, labels: labels, highlighted: index, page: page, lastPage: lastPage, update: false)
   }

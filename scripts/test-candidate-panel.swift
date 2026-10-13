@@ -70,11 +70,12 @@ struct SquirrelApp {
       _ = (receiver ?? controller).handle(event, client: client)
     }
     func type(_ text: String) { for char in text { key(String(char)) } }
-    type(mode == "unsupported" ? "zz" : "xk")
+    let input = mode == "unsupported" ? "zz" : mode == "rc-unicode" ? "em" : mode == "rc-missing" ? "ap" : "xk"
+    type(input)
     guard let initial = controller.candidateDeletionTarget(index: nil) else { print("BLOCK no candidates"); exit(2) }
     let session = initial.session
-    func property(_ name: String) -> String {
-      guard let bytes = rimePropertyBytes(api, session: session, name: name, capacity: 128) else { return "" }
+    func property(_ name: String, capacity: Int = 128) -> String {
+      guard let bytes = rimePropertyBytes(api, session: session, name: name, capacity: capacity) else { return "" }
       return String(bytes: bytes, encoding: .utf8) ?? ""
     }
     func query(_ input: String) { api.clear_composition(session); key("", code: 53); type(input) }
@@ -126,17 +127,36 @@ struct SquirrelApp {
         if let content = window.contentView { snapshot("\(name)-menu-\(index)", content: content) }
       }
     }
-    func nativeInspect(_ row: Int, name: String) {
+    func nativeInspect(_ row: Int, name: String, inspectEntries: Bool = false) {
+      var pending: NSMenu?
       let observer = NotificationCenter.default.addObserver(forName: NSMenu.didBeginTrackingNotification, object: nil, queue: nil) { note in
         MainActor.assumeIsolated {
           guard let active = note.object as? NSMenu else { return }
           let action: @MainActor () -> Void = {
             print("native \(name): \(active.items.map { ($0.title, $0.isEnabled) })")
-            captureOwnMenu(name)
+            captureOwnMenu(name + (pending == nil ? "" : "-entries"))
+            if inspectEntries { pending = active.items.first { $0.submenu != nil }?.submenu }
             active.cancelTracking()
           }
           RunLoop.current.add(Timer(timeInterval: 0.1, repeats: false) { _ in
             MainActor.assumeIsolated { action() }
+          }, forMode: .eventTracking)
+        }
+      }
+      panel.sendEvent(mouse(row))
+      if let pending { _ = pending.popUp(positioning: nil, at: NSPoint(x: 20, y: 20), in: panel.contentView) }
+      NotificationCenter.default.removeObserver(observer)
+    }
+    func nativeDelete(_ row: Int) {
+      let observer = NotificationCenter.default.addObserver(forName: NSMenu.didBeginTrackingNotification, object: nil, queue: nil) { note in
+        MainActor.assumeIsolated {
+          guard let active = note.object as? NSMenu else { return }
+          RunLoop.current.add(Timer(timeInterval: 0.1, repeats: false) { _ in
+            MainActor.assumeIsolated {
+              captureOwnMenu("delete-\(row)")
+              active.performActionForItem(at: 0)
+              active.cancelTracking()
+            }
           }, forMode: .eventTracking)
         }
       }
@@ -173,11 +193,89 @@ struct SquirrelApp {
       NotificationCenter.default.removeObserver(observer)
     }
     snapshot("before")
-    check(initial.highlighted == 0 && initial.candidates.first == (mode == "unsupported" ? "孤舟" : "杏"), "anonymous engine highlights intended first row")
+    let first = mode == "unsupported" ? "孤舟" : mode == "rc-reading" ? "行" : mode == "rc-unicode" ? "🧪" : mode == "rc-missing" ? "无音" : "杏"
+    check(initial.highlighted == 0 && initial.candidates.first == first, "anonymous engine highlights intended first row")
     print("Lua runtime \(property("panel_lua_runtime")); anonymous profile \(userDir.path)")
     let canonical = userDir.appendingPathComponent("suppressed.tsv")
     let header = "# rime-candidate-suppression-v1\n"
-    if mode == "restore-large" {
+    if mode.hasPrefix("rc-") {
+      check(String(cString: api.get_version()!) == "1.16.0" && property("panel_lua_runtime") == "Lua 5.4" && property("suppression_protocol") == "1", "specified actual 1.16.0/Lua5.4 pairing (test assertion only)")
+      let receipt = try! JSONSerialization.jsonObject(with: Data(contentsOf: userDir.appendingPathComponent("anonymous_generation.json"))) as! [String: String]
+      let generation = URL(fileURLWithPath: receipt["path"]!)
+      let originalGeneration = try! Data(contentsOf: generation)
+      func trace(_ name: String) -> String {
+        let value = property(name, capacity: 4096)
+        print("\(name): \(value)")
+        return value
+      }
+      func panelText() -> String {
+        panel.contentView!.subviews.compactMap { $0 as? SquirrelView }.first!.textContentStorage.attributedString?.string ?? ""
+      }
+      check(property("rc_binding") == "ok", "compiler generation bound to genuine owner")
+      if mode == "rc-missing" {
+        check(String(decoding: originalGeneration, as: UTF8.self).contains("reading=hang") && String(decoding: originalGeneration, as: UTF8.self).contains("无音\tap\t9\n"), "compiler generation mixes valid and missing readings")
+        check(trace("rc_identities").contains("user_table|\(receipt["user_dict"]!)|ap |rc_missing_reading|无音"), "missing reading is genuine RC identity failure, not guessed ap")
+        nativeDelete(0)
+        check(controller.candidateDeletionResult == "rc_missing_reading" && controller.candidateDeletionTarget(index: nil)?.candidates == initial.candidates && client.inserts == 0 && !FileManager.default.fileExists(atPath: canonical.path), "missing-reading delete keeps candidate, zero commits/canonical")
+        check(panelText().contains("未删除：候选缺少完整读音") && !panelText().contains("rc_missing_reading"), "missing-reading feedback readable without raw reason")
+        snapshot("missing-reading")
+        key("\u{f728}", code: 117, flags: .control)
+        check(controller.candidateDeletionResult == "rc_missing_reading" && controller.candidateDeletionTarget(index: nil)?.candidates == initial.candidates && !FileManager.default.fileExists(atPath: canonical.path), "keyboard uses same missing-reading failure without native bypass")
+      } else {
+        let code = mode == "rc-page" ? "gu zhou" : mode == "rc-unicode" ? "lü" : "hang"
+        let text = mode == "rc-page" ? "孤舟" : mode == "rc-unicode" ? "🧪" : "行"
+        if mode == "rc-page" {
+          check(initial.candidates == ["杏", "行"], "first page contains only independent base candidates")
+          _ = controller.page(up: false)
+          check(controller.candidateDeletionTarget(index: nil)?.page == 1 && controller.candidateDeletionTarget(index: nil)?.candidates == [text], "real nonfirst page is RC target")
+        }
+        let beforeTrace = trace("rc_identities")
+        check(beforeTrace.contains("user_table|\(receipt["user_dict"]!)|\(input) |\(code)|\(text)"), "real genuine owner/custom_code resolves frozen reading, not trigger")
+        if mode == "rc-reading" { check(beforeTrace.contains("|xing|行"), "base same-text xing genuine coexists before deletion") }
+        snapshot("target")
+        nativeDelete(0)
+        let deletedBytes = Data((header + "\(code)\t\(text)\n").utf8)
+        check(controller.candidateDeletionResult == "ok" && (try! Data(contentsOf: canonical)) == deletedBytes, "native menu persists only exact original reading/text bytes")
+        print("canonical UTF8 hex: \(deletedBytes.map { String(format: "%02x", $0) }.joined())")
+        snapshot("deleted")
+        query(input)
+        let afterTrace = trace("rc_final")
+        check(!afterTrace.contains("user_table|\(receipt["user_dict"]!)|\(input) |\(code)|\(text)"), "RC identity suppressed on requery")
+        if mode == "rc-reading" {
+          check(controller.candidateDeletionTarget(index: nil)?.candidates.contains("行") == true && afterTrace.contains("|xing|行"), "base xing homograph remains, with real identity proof")
+          snapshot("other-reading-retained")
+          query("hh")
+          check(controller.candidateDeletionTarget(index: nil)?.candidates == ["航"] && !trace("rc_final").contains("|hang|行"), "same hang reading hidden across hh trigger")
+        } else if mode == "rc-page" {
+          check(controller.candidateDeletionTarget(index: nil)?.candidates == initial.candidates && afterTrace.contains("|xing|杏") && afterTrace.contains("|xing|行"), "nonfirst deletion preserves first-page identities")
+        } else {
+          check(controller.candidateDeletionTarget(index: nil) == nil && panel.isVisible, "Unicode deletion leaves preedit recovery entrance")
+        }
+        let row = controller.candidateDeletionTarget(index: nil) == nil ? -1 : 0
+        let entries = restoreMenu(menu(row))
+        check(entries.items.map(\.title) == ["\(text)（\(code)）"], "fresh engine list enumerates original pair, not current trigger")
+        nativeRestore(row, code: code, text: text)
+        check(controller.candidateRestorationResult == "ok" && (try! Data(contentsOf: canonical)) == Data(header.utf8), "native restore applies original pair and empties suppression")
+        query(input)
+        if mode == "rc-page" { _ = controller.page(up: false) }
+        check(controller.candidateDeletionTarget(index: nil)?.candidates.contains(text) == true && trace("rc_final").contains("user_table|\(receipt["user_dict"]!)|\(input) |\(code)|\(text)"), "restored genuine RC returns with original UTF8 identity")
+        snapshot("restored")
+        if mode == "rc-unicode" {
+          key("\u{f728}", code: 117, flags: .control)
+          check(controller.candidateDeletionResult == "ok" && (try! Data(contentsOf: canonical)) == deletedBytes && controller.candidateDeletionTarget(index: nil) == nil, "process-local keyboard deletes same Unicode identity through shared apply")
+          nativeRestore(-1, code: code, text: text)
+          check(controller.candidateRestorationResult == "ok" && (try! Data(contentsOf: canonical)) == Data(header.utf8), "Unicode original bytes restored again from zero-candidate preedit")
+        }
+      }
+      check((try! Data(contentsOf: generation)) == originalGeneration, "frozen compiler output unmodified by panel requests")
+      check(client.inserts == 0, "RC menu/list/delete/restore never commit")
+      api.clear_composition(session)
+      api.cleanup_all_sessions()
+      if let custom = api.find_module("levers")?.pointee.get_api?() {
+        let levers = UnsafeRawPointer(custom).assumingMemoryBound(to: RimeLeversApi_stdbool.self).pointee
+        check(levers.export_user_dict("synthetic", userDir.appendingPathComponent("anonymous-learning-export.txt").path) == 0, "RC operations add zero learned entries to base dictionary")
+      } else { check(false, "public no-learning proof available") }
+    } else if mode == "restore-large" {
       let before = try! Data(contentsOf: canonical)
       let date = try! FileManager.default.attributesOfItem(atPath: canonical.path)[.modificationDate] as! Date
       let context = controller.candidateDeletionTarget(index: -1)!
@@ -317,7 +415,10 @@ struct SquirrelApp {
         let failed = menu(0)
         let reason = badStore == "corrupt" ? "storage_invalid" : "storage_read_failed"
         check(controller.candidateRestorationResult == reason && !failed.items.last!.isEnabled && failed.items.first!.isEnabled, "\(badStore) list fails while deletion remains available")
-        nativeInspect(0, name: badStore)
+        let explanation = badStore == "corrupt" ? "持久存储格式异常" : "持久存储读取失败"
+        let text = panel.contentView!.subviews.compactMap { $0 as? SquirrelView }.first!.textContentStorage.attributedString?.string ?? ""
+        check(restoreMenu(failed).items[0].title == "无法读取恢复列表：\(explanation)" && text.contains("未恢复：\(explanation)") && !text.contains(reason), "\(badStore) submenu and panel give readable failure without raw reason")
+        nativeInspect(0, name: badStore, inspectEntries: true)
         snapshot(badStore)
         api.set_property(session, "suppression_action", "sentinel")
         restore(old, code: "xing", text: "行")
@@ -348,7 +449,7 @@ struct SquirrelApp {
       snapshot("failure")
     } else if mode == "unsupported" {
       invoke(menu(0))
-      check(controller.candidateDeletionResult == "unsupported_dictionary" && controller.candidateDeletionTarget(index: nil)?.candidates == ["孤舟"] && client.inserts == 0,
+      check(controller.candidateDeletionResult == "rc_invalid_generation" && controller.candidateDeletionTarget(index: nil)?.candidates == ["孤舟"] && client.inserts == 0,
             "independent native stabledb remains visibly unsupported, no commit")
       snapshot("unsupported")
       check(controller.candidateDeletionResult == "ok" && controller.candidateDeletionTarget(index: nil) == nil,

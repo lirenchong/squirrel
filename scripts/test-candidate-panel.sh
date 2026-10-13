@@ -6,8 +6,9 @@ deps="$root/../squirrel"
 owner="${SUPPRESSION_SOURCE:-/Users/chong/Project/agent-reliability-imk-delete-mac-20261013/subprojects/input-keyboard}"
 runtime="${RIME_RUNTIME:-/Library/Input Methods/Squirrel.app/Contents/Frameworks}"
 mode="${1:-normal}"
-case "$mode" in normal|page|failure|mismatch|unsupported|restore|restore-large|restore-wire|restore-old|restore-learning|restore-page) ;; *) exit 2 ;; esac
-[[ "$(git -C "$owner" rev-parse HEAD)" == d32acc9a1dd8afbf32f8fc4ef0b3c91533c71ffb &&
+case "$mode" in normal|page|failure|mismatch|unsupported|restore|restore-large|restore-wire|restore-old|restore-learning|restore-page|rc-reading|rc-page|rc-unicode|rc-missing) ;; *) exit 2 ;; esac
+# Test-source fixed point, not a production runtime/version gate.
+[[ "$(git -C "$owner" rev-parse HEAD)" == ed272d0d81838a5cfebac86f41c8462cd949b5f2 &&
    -z "$(git -C "$owner" status --porcelain)" ]] || { echo 'Wrong or dirty suppression pairing' >&2; exit 2; }
 mkdir -p "$root/.amp/in"
 out="$(mktemp -d "$root/.amp/in/panel-$mode.XXXXXX")"
@@ -19,8 +20,8 @@ cp "$runtime/librime.1.dylib" "$app/Contents/Frameworks/"
 if [[ -f "$runtime/rime-plugins/librime-lua.dylib" ]]; then
   cp "$runtime/rime-plugins/librime-lua.dylib" "$app/Contents/Frameworks/"
 fi
-python3 - "$app" "$out/profile" "$owner" "$mode" <<'PY'
-import pathlib, plistlib, shutil, subprocess, sys
+python3 -B - "$app" "$out/profile" "$owner" "$mode" <<'PY'
+import hashlib, importlib.util, json, pathlib, plistlib, shutil, subprocess, sys
 app, profile, source = map(pathlib.Path, sys.argv[1:4]); mode = sys.argv[4]
 with (app/'Contents/Info.plist').open('wb') as f:
     plistlib.dump(dict(CFBundleIdentifier='im.rime.inputmethod.Squirrel.PanelTests', CFBundleExecutable='PanelTests', CFBundleVersion='1', CFBundlePackageType='APPL'), f)
@@ -34,17 +35,73 @@ if mode == 'restore-old':
 schema = (source/'tests/fixtures/rime_candidate_suppression/synthetic.schema.yaml').read_text()
 schema = schema.replace('processors: [', 'processors: [lua_processor@suppression_processor, ')
 schema = schema.replace('filters: [uniquifier]', 'filters: [uniquifier, lua_filter@runtime_trace, lua_filter@suppression_filter]')
-schema = schema.replace('page_size: 9', 'page_size: '+('1' if mode in ('page', 'restore-page') else '9'))
+schema = schema.replace('page_size: 9', 'page_size: '+('2' if mode == 'rc-page' else '1' if mode in ('page', 'restore-page') else '9'))
 schema += '\ncandidate_suppression:\n  path: '+str(profile/'suppressed.tsv')+'\n'
 if mode == 'unsupported':
     schema = schema.replace('translators: [script_translator]', 'translators: [table_translator@custom_phrase, script_translator]')
     schema += '\ncustom_phrase:\n  dictionary: ""\n  user_dict: custom_phrase\n  db_class: stabledb\n  enable_completion: false\n  enable_sentence: false\n'
     (profile/'custom_phrase.txt').write_text('孤舟\tzz\t9\n')
+if mode.startswith('rc-'):
+    rows = {'rc-reading': '行\txk\t1\treading=hang\n',
+            'rc-page': '孤舟\txk\t3\treading=gu zhou\n',
+            'rc-unicode': '🧪\tem\t1\treading=lü\n',
+            'rc-missing': '行\txk\t1\treading=hang\n无音\tap\t1\n'}[mode]
+    editable = profile/'anonymous_editable_rc.tsv'
+    editable.write_text(rows, encoding='utf-8')
+    dictionary = profile/'anonymous_readings.dict.yaml'
+    dictionary.write_text('---\nname: anonymous_readings\nversion: "1"\n...\n'
+                          '甲\txing\n乙\thang\n丙\tgu zhou\n丁\tlü\n', encoding='utf-8')
+    spec = importlib.util.spec_from_file_location('panel_rc_compiler', source/'scripts/compile_custom_phrase_rc.py')
+    compiler = importlib.util.module_from_spec(spec)
+    sys.modules[spec.name] = compiler
+    spec.loader.exec_module(compiler)
+    receipt = compiler.compile_reading_generation(editable, profile/'unused_target.txt', dictionary)
+    assert hashlib.sha256(pathlib.Path(receipt['path']).read_bytes()).hexdigest() == receipt['digest']
+    (profile/'anonymous_generation.json').write_text(json.dumps(receipt))
+    print('anonymous compiler generation:', receipt)
+    shutil.copy(source/'lua/custom_phrase_position_filter.lua', profile/'lua/pin.lua')
+    schema = schema.replace('translators: [script_translator]', 'translators: [table_translator@custom_phrase, script_translator]')
+    schema = schema.replace('filters: [uniquifier, lua_filter@runtime_trace, lua_filter@suppression_filter]',
+        'filters: [lua_filter@pin, uniquifier, lua_filter@runtime_trace, lua_filter@rc_trace, lua_filter@suppression_filter, lua_filter@rc_final_trace]')
+    schema += '\ncustom_phrase:\n  dictionary: ""\n  user_dict: '+receipt['user_dict']+'\n  db_class: stabledb\n  enable_completion: false\n  enable_sentence: false\n'
+    # Explicit anonymous source even for pin fallback; never use default RC.
+    schema += '\ncustom_phrase_position_filter:\n  source: '+receipt['path']+'\n'
 (profile/'synthetic.schema.yaml').write_text(schema)
 (profile/'synthetic_other.schema.yaml').write_text(schema.replace('schema_id: synthetic', 'schema_id: synthetic_other'))
 (profile/'default.yaml').write_text('config_version: "1"\nschema_list:\n  - schema: synthetic\n')
 (profile/'squirrel.yaml').write_text('config_version: "1"\nshow_notifications_when: never\nstyle:\n  inline_preedit: false\n  inline_candidate: false\n')
 (profile/'rime.lua').write_text('local s = require("rime_candidate_suppression")\nsuppression_processor = s.processor\nsuppression_filter = s.filter\nruntime_trace = {func=function(input, env) env.engine.context:set_property("panel_lua_runtime", _VERSION); for cand in input:iter() do yield(cand) end end}\n')
+if mode.startswith('rc-'):
+    with (profile/'rime.lua').open('a') as f:
+        f.write('''
+pin = require("pin")
+local function describe(genuine, env)
+  local phrase = genuine:to_phrase()
+  local code, text, err = s.candidate_identity(genuine, env)
+  return genuine.type .. "|" .. (phrase and phrase.lang_name or "-") .. "|" ..
+    (phrase and phrase.entry.custom_code or "-") .. "|" .. (code or err) .. "|" .. (text or genuine.text)
+end
+rc_trace = {init=s.init, fini=s.fini, func=function(input, env)
+  local rows = {}
+  env.engine.context:set_property("rc_binding", env.suppression_rc.error or "ok")
+  env.engine.context:set_property("rc_identities", "")
+  for cand in input:iter() do
+    for _, genuine in ipairs(s.genuines(cand)) do rows[#rows+1] = describe(genuine, env) end
+    env.engine.context:set_property("rc_identities", table.concat(rows, ";"))
+    yield(cand)
+  end
+end}
+-- Observation only: suppression remains the final mutating filter.
+rc_final_trace = {init=s.init, fini=s.fini, func=function(input, env)
+  local rows = {}
+  env.engine.context:set_property("rc_final", "")
+  for cand in input:iter() do
+    for _, genuine in ipairs(s.genuines(cand)) do rows[#rows+1] = describe(genuine, env) end
+    env.engine.context:set_property("rc_final", table.concat(rows, ";"))
+    yield(cand)
+  end
+end}
+''')
 if mode == 'restore-wire':
     # Deliberately corrupt only public response properties in this anonymous
     # transport fixture. The canonical backend remains the unchanged writer.
