@@ -155,18 +155,41 @@ final class SquirrelPanel: NSPanel {
 
   func candidateMenu(for event: NSEvent) -> NSMenu? {
     let point = view.convert(event.locationInWindow, from: nil)
-    let (row, _, _) = view.click(at: point)
-    guard let row, let controller = inputController,
-          let target = controller.candidateDeletionTarget(index: row),
-          target.page == page, target.candidates == candidates else { return nil }
+    let (row, preeditIndex, _) = view.click(at: point)
+    guard row != nil || preeditIndex != nil, let controller = inputController,
+          let context = controller.candidateDeletionTarget(index: -1),
+          context.page == page, context.candidates == candidates else { return nil }
     let menu = NSMenu()
     menu.autoenablesItems = false
-    let item = menu.addItem(withTitle: "删除此候选", action: #selector(deleteCandidateFromMenu(_:)), keyEquivalent: "")
-    item.target = self
-    item.representedObject = target
-    item.isEnabled = controller.candidateDeletionUnavailableReason == nil
-    if !item.isEnabled {
-      menu.addItem(withTitle: "当前运行库或方案不支持候选删除", action: nil, keyEquivalent: "").isEnabled = false
+    if let row, let target = controller.candidateDeletionTarget(index: row) {
+      let item = menu.addItem(withTitle: "删除此候选", action: #selector(deleteCandidateFromMenu(_:)), keyEquivalent: "")
+      item.target = self
+      item.representedObject = target
+      item.isEnabled = controller.candidateDeletionUnavailableReason == nil
+    }
+    let restore = menu.addItem(withTitle: "恢复已删除候选", action: nil, keyEquivalent: "")
+    let submenu = NSMenu()
+    submenu.autoenablesItems = false
+    restore.submenu = submenu
+    if let entries = controller.suppressedCandidates(for: context) {
+      restore.isEnabled = !entries.isEmpty
+      if entries.isEmpty {
+        restore.title += "（暂无记录）"
+        submenu.addItem(withTitle: "暂无已删除候选", action: nil, keyEquivalent: "").isEnabled = false
+      }
+      for entry in entries {
+        let displayText = entry.text.replacingOccurrences(of: "\t", with: "⇥")
+          .replacingOccurrences(of: "\r", with: "␍").replacingOccurrences(of: "\n", with: "↵")
+        let item = submenu.addItem(withTitle: "\(displayText)（\(entry.code)）", action: #selector(restoreCandidateFromMenu(_:)), keyEquivalent: "")
+        item.target = self
+        item.representedObject = SquirrelInputController.CandidateRestorationTarget(context: context, entry: entry,
+          generation: controller.candidateRestorationGeneration)
+      }
+    } else {
+      restore.isEnabled = false
+      restore.title += "（读取失败）"
+      submenu.addItem(withTitle: "无法读取恢复列表：\(controller.candidateRestorationResult)", action: nil, keyEquivalent: "").isEnabled = false
+      presentCandidateRestorationResult(controller.candidateRestorationResult)
     }
     return menu
   }
@@ -174,6 +197,25 @@ final class SquirrelPanel: NSPanel {
   @objc private func deleteCandidateFromMenu(_ item: NSMenuItem) {
     guard let target = item.representedObject as? SquirrelInputController.CandidateDeletionTarget else { return }
     inputController?.deleteCandidate(target)
+  }
+
+  @objc private func restoreCandidateFromMenu(_ item: NSMenuItem) {
+    guard let target = item.representedObject as? SquirrelInputController.CandidateRestorationTarget else { return }
+    inputController?.restoreCandidate(target)
+  }
+
+  func presentCandidateRestorationResult(_ result: String) {
+    switch result {
+    case "ok": candidateDeletionMessage = "已恢复所选候选"
+    case "stale_target": candidateDeletionMessage = "未恢复：候选或菜单已变化，请重新右击"
+    case "storage_write_failed", "storage_replace_failed": candidateDeletionMessage = "未恢复：持久存储写入失败"
+    case "invalid_action": candidateDeletionMessage = "未恢复：当前后端不支持列表读取"
+    case "invalid_payload": candidateDeletionMessage = "未恢复：恢复列表不完整或格式无效"
+    case "unavailable", "incompatible_runtime": candidateDeletionMessage = "未恢复：当前运行库或方案不支持"
+    default: candidateDeletionMessage = "未恢复：\(result)"
+    }
+    update(preedit: preedit, selRange: selRange, caretPos: caretPos, candidates: candidates,
+           comments: comments, labels: labels, highlighted: index, page: page, lastPage: lastPage, update: false)
   }
 
   func presentCandidateDeletionResult(_ result: String) {

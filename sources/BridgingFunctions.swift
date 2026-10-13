@@ -27,6 +27,19 @@ func rimeAPIHasFunction<T>(_ member: KeyPath<RimeApi_stdbool, T>) -> Bool {
   return UnsafeRawPointer(api).load(fromByteOffset: offset, as: UnsafeRawPointer?.self) != nil
 }
 
+// get_property may return true for a full, unterminated prefix. Never scan
+// beyond the supplied buffer or decode an incomplete UTF-8 sequence.
+func rimePropertyBytes(_ api: RimeApi_stdbool, session: RimeSessionId, name: String, capacity: Int) -> [UInt8]? {
+  guard capacity > 0, rimeAPIHasFunction(\.get_property) else { return nil }
+  guard let memory = malloc(capacity) else { return nil }
+  defer { free(memory) }
+  memset(memory, 255, capacity)
+  let pointer = memory.assumingMemoryBound(to: CChar.self)
+  let buffer = UnsafeBufferPointer(start: pointer, count: capacity)
+  guard api.get_property(session, name, pointer, capacity), let end = buffer.firstIndex(of: 0) else { return nil }
+  return buffer[..<end].map { UInt8(bitPattern: $0) }
+}
+
 extension DataSizeable {
   static func rimeStructInit() -> Self {
     let valuePointer = UnsafeMutablePointer<Self>.allocate(capacity: 1)

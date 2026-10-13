@@ -26,8 +26,11 @@ final class SquirrelInputController: IMKInputController {
   private var inlineCandidate = false
   private var candidateRevision: UInt64 = 0
   private(set) var candidateDeletionResult = ""
+  private(set) var candidateRestorationResult = ""
+  private(set) var candidateRestorationGeneration: UInt64 = 0
 
   struct CandidateDeletionTarget: Equatable {
+    let controller: ObjectIdentifier
     let session: RimeSessionId
     let revision: UInt64
     let schema: String
@@ -40,6 +43,17 @@ final class SquirrelInputController: IMKInputController {
     let candidates: [String]
     let comments: [String]
     let index: Int
+  }
+
+  struct SuppressedCandidate {
+    let code: String
+    let text: String
+  }
+
+  struct CandidateRestorationTarget {
+    let context: CandidateDeletionTarget
+    let entry: SuppressedCandidate
+    let generation: UInt64
   }
 
   // for chord-typing
@@ -227,16 +241,17 @@ final class SquirrelInputController: IMKInputController {
   }
 
   var candidateDeletionUnavailableReason: String? {
-    guard rimeAPIHasFunction(\.get_version),
-          let version = rimeAPI.get_version(), String(cString: version) == "1.16.0",
+    guard rimeAPIHasFunction(\.get_property), rimeAPIHasFunction(\.set_property),
+          rimeAPIHasFunction(\.process_key),
           rimeAPIHasFunction(\.highlight_candidate_on_current_page) else { return "incompatible_runtime" }
     guard suppressionProperty("suppression_protocol") == "1" else { return "unavailable" }
     return nil
   }
 
   private func suppressionProperty(_ name: String) -> String {
-    var buffer = [CChar](repeating: 0, count: 256)
-    return rimeAPI.get_property(session, name, &buffer, buffer.count) ? String(cString: buffer) : ""
+    guard let bytes = rimePropertyBytes(rimeAPI, session: session, name: name, capacity: 128),
+          let value = String(bytes: bytes, encoding: .utf8) else { return "" }
+    return value
   }
 
   func candidateDeletionTarget(index: Int?) -> CandidateDeletionTarget? {
@@ -248,10 +263,14 @@ final class SquirrelInputController: IMKInputController {
     guard rimeAPI.get_status(session, &status) else { return nil }
     defer { _ = rimeAPI.free_status(&status) }
     let row = index ?? Int(context.menu.highlighted_candidate_index)
-    guard row >= 0, row < context.menu.num_candidates, let rows = context.menu.candidates else { return nil }
-    let candidates = (0..<Int(context.menu.num_candidates)).map { String(cString: rows[$0].text) }
-    let comments = (0..<Int(context.menu.num_candidates)).map { rows[$0].comment.map { String(cString: $0) } ?? "" }
-    return CandidateDeletionTarget(session: session, revision: candidateRevision,
+    // -1 captures menu context even after the last candidate is suppressed.
+    guard row == -1 || (row >= 0 && row < context.menu.num_candidates) else { return nil }
+    guard context.composition.length > 0 else { return nil }
+    let rows = context.menu.candidates
+    guard context.menu.num_candidates >= 0, context.menu.num_candidates == 0 || rows != nil else { return nil }
+    let candidates = (0..<Int(context.menu.num_candidates)).map { String(cString: rows![$0].text) }
+    let comments = (0..<Int(context.menu.num_candidates)).map { rows![$0].comment.map { String(cString: $0) } ?? "" }
+    return CandidateDeletionTarget(controller: ObjectIdentifier(self), session: session, revision: candidateRevision,
       schema: status.schema_id.map { String(cString: $0) } ?? "",
       input: rimeAPI.get_input(session).map { String(cString: $0) } ?? "",
       preedit: context.composition.preedit.map { String(cString: $0) } ?? "",
@@ -260,7 +279,7 @@ final class SquirrelInputController: IMKInputController {
   }
 
   func deleteCandidate(_ target: CandidateDeletionTarget) {
-    if target != candidateDeletionTarget(index: target.index) {
+    if target.index < 0 || target != candidateDeletionTarget(index: target.index) {
       candidateDeletionResult = "stale_target"
     } else if let reason = candidateDeletionUnavailableReason {
       candidateDeletionResult = reason
@@ -281,6 +300,100 @@ final class SquirrelInputController: IMKInputController {
     // Refresh from the engine even on failure. A consumed key is not success.
     rimeUpdate()
     NSApp.squirrelAppDelegate.panel?.presentCandidateDeletionResult(candidateDeletionResult)
+  }
+
+  // Synchronous request + all property reads: do not yield or reuse a snapshot
+  // from a previous request. List is read-only and must not rimeUpdate/highlight.
+  func suppressedCandidates(for context: CandidateDeletionTarget) -> [SuppressedCandidate]? {
+    candidateRestorationGeneration &+= 1
+    if context != candidateDeletionTarget(index: -1) {
+      candidateRestorationResult = "stale_target"
+      return nil
+    }
+    if let reason = candidateDeletionUnavailableReason {
+      candidateRestorationResult = reason
+      return nil
+    }
+    rimeAPI.set_property(session, "suppression_result", "")
+    rimeAPI.set_property(session, "suppression_action", "list")
+    _ = rimeAPI.process_key(session, 65481, 12)
+    candidateRestorationResult = suppressionProperty("suppression_result")
+    guard candidateRestorationResult == "ok" else {
+      if candidateRestorationResult.isEmpty { candidateRestorationResult = "unconfirmed" }
+      return nil
+    }
+    let metadata = suppressionProperty("suppression_entries_bytes")
+    guard !metadata.isEmpty, metadata.utf8.allSatisfy({ $0 >= 48 && $0 <= 57 }),
+          let count = Int(metadata), count >= 32, count < Int.max,
+          let bytes = rimePropertyBytes(rimeAPI, session: session, name: "suppression_entries", capacity: count + 1),
+          bytes.count == count, let entries = Self.decodeSuppressedCandidates(bytes),
+          context == candidateDeletionTarget(index: -1) else {
+      candidateRestorationResult = "invalid_payload"
+      return nil
+    }
+    return entries
+  }
+
+  private static func decodeSuppressedCandidates(_ bytes: [UInt8]) -> [SuppressedCandidate]? {
+    let header = Array("# rime-candidate-suppression-v1\n".utf8)
+    guard bytes.starts(with: header), bytes.last == 10, String(bytes: bytes, encoding: .utf8) != nil else { return nil }
+    if bytes.count == header.count { return [] }
+    func field(_ raw: ArraySlice<UInt8>) -> String? {
+      var decoded = [UInt8]()
+      var index = raw.startIndex
+      while index < raw.endIndex {
+        let byte = raw[index]
+        if byte == 37 {
+          guard index + 2 < raw.endIndex else { return nil }
+          let escape = Array(raw[index...index + 2])
+          switch escape {
+          case [37, 50, 53]: decoded.append(37)
+          case [37, 48, 57]: decoded.append(9)
+          case [37, 48, 68]: decoded.append(13)
+          case [37, 48, 65]: decoded.append(10)
+          default: return nil
+          }
+          index += 3
+        } else {
+          guard byte != 0 && byte != 9 && byte != 10 && byte != 13 else { return nil }
+          decoded.append(byte)
+          index += 1
+        }
+      }
+      guard !decoded.isEmpty else { return nil }
+      return String(bytes: decoded, encoding: .utf8)
+    }
+    let lines = bytes[header.count..<bytes.count - 1].split(separator: 10, omittingEmptySubsequences: false)
+    var previous: ArraySlice<UInt8>?
+    var entries = [SuppressedCandidate]()
+    for line in lines {
+      if let previous, !previous.lexicographicallyPrecedes(line) { return nil }
+      let fields = line.split(separator: 9, omittingEmptySubsequences: false)
+      guard fields.count == 2, let code = field(fields[0]), let text = field(fields[1]),
+            !code.utf8.contains(where: { [0, 9, 10, 13].contains($0) }),
+            Array(code.utf8.split(separator: 32).joined(separator: [32])) == Array(code.utf8) else { return nil }
+      entries.append(SuppressedCandidate(code: code, text: text))
+      previous = line
+    }
+    return entries
+  }
+
+  func restoreCandidate(_ target: CandidateRestorationTarget) {
+    if target.generation != candidateRestorationGeneration || target.context != candidateDeletionTarget(index: -1) {
+      candidateRestorationResult = "stale_target"
+    } else if let reason = candidateDeletionUnavailableReason {
+      candidateRestorationResult = reason
+    } else {
+      rimeAPI.set_property(session, "suppression_result", "")
+      rimeAPI.set_property(session, "suppression_code", target.entry.code)
+      rimeAPI.set_property(session, "suppression_text", target.entry.text)
+      rimeAPI.set_property(session, "suppression_action", "restore")
+      _ = rimeAPI.process_key(session, 65481, 12)
+      let result = suppressionProperty("suppression_result")
+      candidateRestorationResult = result.isEmpty ? "unconfirmed" : result
+    }
+    rimeUpdate()
+    NSApp.squirrelAppDelegate.panel?.presentCandidateRestorationResult(candidateRestorationResult)
   }
 
   func selectCandidate(_ index: Int) -> Bool {
