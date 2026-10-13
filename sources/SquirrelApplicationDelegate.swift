@@ -18,7 +18,11 @@ final class SquirrelApplicationDelegate: NSObject, NSApplicationDelegate, SPUSta
   var config: SquirrelConfig?
   var panel: SquirrelPanel?
   var enableNotifications = false
+  #if SYNTHETIC_IMK_PROBE
+  let updateController = SPUStandardUpdaterController(startingUpdater: false, updaterDelegate: nil, userDriverDelegate: nil)
+  #else
   let updateController = SPUStandardUpdaterController(startingUpdater: true, updaterDelegate: nil, userDriverDelegate: nil)
+  #endif
   var supportsGentleScheduledUpdateReminders: Bool {
     true
   }
@@ -85,12 +89,16 @@ final class SquirrelApplicationDelegate: NSObject, NSApplicationDelegate, SPUSta
   }
 
   func checkForUpdates() {
+    #if SYNTHETIC_IMK_PROBE
+    return
+    #else
     if updateController.updater.canCheckForUpdates {
       print("Checking for updates")
       updateController.updater.checkForUpdates()
     } else {
       print("Cannot check for updates")
     }
+    #endif
   }
 
   func openWiki() {
@@ -138,7 +146,11 @@ final class SquirrelApplicationDelegate: NSObject, NSApplicationDelegate, SPUSta
     squirrelTraits.setCString("Squirrel", to: \.distribution_code_name)
     squirrelTraits.setCString("鼠鬚管", to: \.distribution_name)
     squirrelTraits.setCString(Bundle.main.object(forInfoDictionaryKey: kCFBundleVersionKey as String) as! String, to: \.distribution_version)
+    #if SYNTHETIC_IMK_PROBE
+    squirrelTraits.setCString("rime.squirrel.synthetic-test", to: \.app_name)
+    #else
     squirrelTraits.setCString("rime.squirrel", to: \.app_name)
+    #endif
     rimeAPI.setup(&squirrelTraits)
   }
 
@@ -222,9 +234,11 @@ final class SquirrelApplicationDelegate: NSObject, NSApplicationDelegate, SPUSta
     let center = NSWorkspace.shared.notificationCenter
     center.addObserver(forName: NSWorkspace.willPowerOffNotification, object: nil, queue: nil, using: workspaceWillPowerOff)
 
+    #if !SYNTHETIC_IMK_PROBE
     let notifCenter = DistributedNotificationCenter.default()
     notifCenter.addObserver(forName: .init("SquirrelReloadNotification"), object: nil, queue: nil, using: rimeNeedsReload)
     notifCenter.addObserver(forName: .init("SquirrelSyncNotification"), object: nil, queue: nil, using: rimeNeedsSync)
+    #endif
   }
 
   func applicationShouldTerminate(_ sender: NSApplication) -> NSApplication.TerminateReply {

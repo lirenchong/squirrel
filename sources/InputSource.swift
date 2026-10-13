@@ -11,8 +11,13 @@ import InputMethodKit
 final class SquirrelInstaller {
   enum InputMode: String, CaseIterable {
     static let primary = Self.hans
+    #if SYNTHETIC_IMK_PROBE
+    case hans = "im.rime.inputmethod.Squirrel.SyntheticTest.Hans"
+    case hant = "im.rime.inputmethod.Squirrel.SyntheticTest.Hant"
+    #else
     case hans = "im.rime.inputmethod.Squirrel.Hans"
     case hant = "im.rime.inputmethod.Squirrel.Hant"
+    #endif
   }
   private lazy var inputSources: [String: TISInputSource] = {
     var inputSources = [String: TISInputSource]()

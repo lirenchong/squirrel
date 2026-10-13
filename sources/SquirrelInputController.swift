@@ -6,6 +6,9 @@
 //
 
 import InputMethodKit
+#if SYNTHETIC_IMK_PROBE
+import OSLog
+#endif
 
 final class SquirrelInputController: IMKInputController {
   private static let keyRollOver = 50
@@ -28,10 +31,27 @@ final class SquirrelInputController: IMKInputController {
   private var chordTimer: Timer?
   private var chordDuration: TimeInterval = 0
   private var currentApp: String = ""
+  // One switch for every session, menu action and keyboard shortcut. This
+  // development build starts off; it does not change global user preferences.
+  private static var autoSpacing = false
+  private static let controllers = NSHashTable<SquirrelInputController>.weakObjects()
+  private var spacingToken: SpacingComposition?
+  private var spacingFault = false
+  #if SYNTHETIC_IMK_PROBE
+  private enum ProbeMode { case off, composed, targeted, rightFirst, emptyMark }
+  private var probeMode: ProbeMode = .off
+  private static let syntheticHostID = "com.example.SquirrelSyntheticTextHost"
+  private static let lifecycleLog = Logger(subsystem: Bundle.main.bundleIdentifier ?? "SquirrelTests", category: "lifecycle")
+  #endif
 
   // swiftlint:disable:next cyclomatic_complexity
   override func handle(_ event: NSEvent!, client sender: Any!) -> Bool {
     guard let event = event else { return false }
+    #if SYNTHETIC_IMK_PROBE
+    if (sender as? IMKTextInput)?.bundleIdentifier() == Self.syntheticHostID {
+      Self.lifecycleLog.notice("handle")
+    }
+    #endif
     let modifiers = event.modifierFlags
     let changes = lastModifiers.symmetricDifference(modifiers)
 
@@ -56,6 +76,7 @@ final class SquirrelInputController: IMKInputController {
 
     switch event.type {
     case .flagsChanged:
+      let wasASCII = rimeAPI.get_option(session, "ascii_mode")
       if lastModifiers == modifiers {
         handled = true
         break
@@ -102,13 +123,42 @@ final class SquirrelInputController: IMKInputController {
       }
 
       lastModifiers = modifiers
+      if spacingToken != nil && wasASCII != rimeAPI.get_option(session, "ascii_mode") {
+        finishSpacingToken()
+      }
       rimeUpdate()
 
     case .keyDown:
+      let shortcutFlags = modifiers.intersection([.control, .option, .shift, .command])
+      if event.keyCode == 1 && shortcutFlags == [.control, .option] {
+        if !event.isARepeat { toggleAutoSpacing() }
+        return true
+      }
+      #if SYNTHETIC_IMK_PROBE
+      if client?.bundleIdentifier() == Self.syntheticHostID {
+        Self.lifecycleLog.notice("keyState ascii=\(self.rimeAPI.get_option(self.session, "ascii_mode")) spacing=\(self.spacingAllowed) config=\(NSApp.squirrelAppDelegate.config?.isOpen == true) plain=\(modifiers.isSubset(of: [.shift, .capsLock]))")
+      }
+      #endif
+      if let result = handleSpacingKey(event) { return result }
       // ignore Command+X hotkeys.
       if modifiers.contains(.command) {
         break
       }
+
+      #if SYNTHETIC_IMK_PROBE
+      // Only intercept printable synthetic-host ASCII input while Rime is idle.
+      // A failed preflight leaves the original key event on its old pass-through path.
+      if probeMode != .off, client?.bundleIdentifier() == Self.syntheticHostID,
+         rimeAPI.get_option(session, "ascii_mode"),
+         modifiers.isSubset(of: [.shift, .capsLock]),
+         (rimeAPI.get_input(session).map { String(cString: $0).isEmpty } ?? true),
+         let characters = event.characters, characters.count == 1,
+         let char = characters.first, char.isASCII && (char.isLetter || char.isNumber),
+         probeCommit(characters, passthrough: true) {
+        handled = true
+        break
+      }
+      #endif
 
       let keyCode = event.keyCode
       var keyChars = event.charactersIgnoringModifiers
@@ -125,8 +175,13 @@ final class SquirrelInputController: IMKInputController {
                                                            shift: modifiers.contains(.shift),
                                                            caps: modifiers.contains(.capsLock))
         if rimeKeycode != 0 {
+          #if SYNTHETIC_IMK_PROBE
+          traceIMKState("beforeRimeKeyDown")
+          #endif
           let rimeModifiers = SquirrelKeycode.osxModifiersToRime(modifiers: modifiers)
           handled = processKey(rimeKeycode, modifiers: rimeModifiers)
+          if !handled && beginSpacingToken(event) { return true }
+          if spacingToken != nil { finishSpacingToken() }
           rimeUpdate()
         }
       }
@@ -182,6 +237,19 @@ final class SquirrelInputController: IMKInputController {
 
   override func activateServer(_ sender: Any!) {
     self.client ?= sender as? IMKTextInput
+    #if SYNTHETIC_IMK_PROBE
+    if client?.bundleIdentifier() == Self.syntheticHostID {
+      Self.lifecycleLog.notice("activateServer")
+      // Observe the actual remote proxy, not a local NSTextView adapter.
+      // Capability discovery only: never invoke these host-side methods here.
+      let object = client as? NSObjectProtocol
+      let textClient = client as? NSTextInputClient
+      let unmark = object?.responds(to: #selector(NSTextInputClient.unmarkText)) == true
+      let command = object?.responds(to: #selector(NSTextInputClient.doCommand(by:))) == true
+      Self.lifecycleLog.notice("publicClientCapability object=\(object != nil) textClient=\(textClient != nil) unmark=\(unmark) command=\(command)")
+      traceIMKState("activateServer")
+    }
+    #endif
     // print("[DEBUG] activateServer:")
     var keyboardLayout = NSApp.squirrelAppDelegate.config?.getString("keyboard_layout") ?? ""
     if keyboardLayout == "last" || keyboardLayout == "" {
@@ -202,6 +270,12 @@ final class SquirrelInputController: IMKInputController {
     // print("[DEBUG] initWithServer: \(server ?? .init()) delegate: \(delegate ?? "nil") client:\(client ?? "nil")")
     super.init(server: server, delegate: delegate, client: client)
     createSession()
+    Self.controllers.add(self)
+    #if SYNTHETIC_IMK_PROBE
+    if self.client?.bundleIdentifier() == Self.syntheticHostID {
+      Self.lifecycleLog.notice("controllerInit")
+    }
+    #endif
   }
 
   override func deactivateServer(_ sender: Any!) {
@@ -209,6 +283,7 @@ final class SquirrelInputController: IMKInputController {
     hidePalettes()
     commitComposition(sender)
     client = nil
+    spacingFault = false
   }
 
   override func hidePalettes() {
@@ -228,6 +303,10 @@ final class SquirrelInputController: IMKInputController {
    */
   override func commitComposition(_ sender: Any!) {
     self.client ?= sender as? IMKTextInput
+    if spacingToken != nil {
+      finishSpacingToken()
+      return
+    }
     // print("[DEBUG] commitComposition: \(sender ?? "nil")")
     //  commit raw input
     if session != 0 {
@@ -239,6 +318,29 @@ final class SquirrelInputController: IMKInputController {
   }
 
   override func menu() -> NSMenu! {
+    let spacing = NSMenuItem(title: "自动中英数字空格", action: #selector(toggleAutoSpacing), keyEquivalent: "s")
+    spacing.keyEquivalentModifierMask = [.control, .option]
+    spacing.target = self
+    spacing.state = Self.autoSpacing ? .on : .off
+    #if SYNTHETIC_IMK_PROBE
+    let menu = NSMenu()
+    menu.addItem(spacing)
+    menu.addItem(.separator())
+    let modes: [(String, Selector, Bool)] = [
+      ("Synthetic probe off", #selector(probeOff), probeMode == .off),
+      ("A: composed boundary commit", #selector(probeComposed), probeMode == .composed),
+      ("B: targeted boundary inserts", #selector(probeTargeted), probeMode == .targeted),
+      ("C: right boundary, then ASCII commit", #selector(probeRightFirst), probeMode == .rightFirst),
+      ("D: empty mark caret hypothesis", #selector(probeEmptyMark), probeMode == .emptyMark)
+    ]
+    for (title, selector, active) in modes {
+      let item = NSMenuItem(title: title, action: selector, keyEquivalent: "")
+      item.target = self
+      item.state = active ? .on : .off
+      menu.addItem(item)
+    }
+    return menu
+    #else
     let deploy = NSMenuItem(title: NSLocalizedString("Deploy", comment: "Menu item"), action: #selector(deploy), keyEquivalent: "`")
     deploy.target = self
     deploy.keyEquivalentModifierMask = [.control, .option]
@@ -254,6 +356,8 @@ final class SquirrelInputController: IMKInputController {
     update.target = self
 
     let menu = NSMenu()
+    menu.addItem(spacing)
+    menu.addItem(.separator())
     menu.addItem(deploy)
     menu.addItem(sync)
     menu.addItem(logDir)
@@ -262,7 +366,241 @@ final class SquirrelInputController: IMKInputController {
     menu.addItem(update)
 
     return menu
+    #endif
   }
+
+  @objc func toggleAutoSpacing() {
+    for controller in Self.controllers.allObjects { controller.finishSpacingToken() }
+    Self.autoSpacing.toggle()
+  }
+
+  private var spacingAllowed: Bool {
+    guard Self.autoSpacing, !spacingFault else { return false }
+    #if SYNTHETIC_IMK_PROBE
+    // The disposable IME must never inspect text in a user's real application.
+    return client?.bundleIdentifier() == Self.syntheticHostID && probeMode == .off
+    #else
+    return true
+    #endif
+  }
+
+  private func idleSpacingComposition() -> SpacingComposition? {
+    guard spacingAllowed, let client, session != 0, preedit.isEmpty,
+          (rimeAPI.get_input(session).map { $0.pointee == 0 } ?? true) else { return nil }
+    let marked = client.markedRange()
+    // A zero-length mark alone says nothing about ownership. The controller
+    // and librime must both be idle, and only the current insertion is replaced.
+    guard marked.location == NSNotFound || marked.length == 0 else { return nil }
+    let selected = client.selectedRange()
+    guard selected.length == 0 else { return nil }
+    return SpacingComposition(client: client, replacing: selected)
+  }
+
+  private func beginSpacingToken(_ event: NSEvent) -> Bool {
+    guard event.modifierFlags.isSubset(of: [.shift, .capsLock]),
+          let characters = event.characters, characters.count == 1,
+          let char = characters.first, char.isASCII, let client else { return false }
+    if let token = spacingToken {
+      spacingFault = !token.update(token.text + characters, in: client)
+      return true
+    }
+    guard char.isLetter || char.isNumber, let composition = idleSpacingComposition() else { return false }
+    spacingToken = composition
+    spacingFault = !composition.update(characters, in: client)
+    return true // A write was attempted. Never also pass the same key through.
+  }
+
+  // nil continues normal Rime routing, false passes straight to the host.
+  private func handleSpacingKey(_ event: NSEvent) -> Bool? {
+    if spacingFault { return false }
+    guard let token = spacingToken, let client else { return nil }
+    guard token.isCurrent(in: client) else {
+      spacingToken = nil
+      spacingFault = true
+      return false // Host moved/changed the mark; never overwrite stale offsets.
+    }
+    let plain = event.modifierFlags.isSubset(of: [.shift, .capsLock])
+    if plain && event.keyCode == 53 {
+      finishSpacingToken(cancel: true)
+      return true
+    }
+    if plain && event.keyCode == 51 {
+      let remaining = String(token.text.dropLast())
+      if remaining.isEmpty { finishSpacingToken(cancel: true) }
+      else { spacingFault = !token.update(remaining, in: client) }
+      return true
+    }
+    if plain && event.keyCode == 49 {
+      finishSpacingToken(space: true)
+      return true
+    }
+    if plain, let characters = event.characters, characters.unicodeScalars.count == 1,
+       let scalar = characters.unicodeScalars.first, (0x21...0x7E).contains(scalar.value) {
+      // Let librime observe every key (including Shift-use and Pinyin). Only
+      // its unhandled text extends our token; handled text ends it first.
+      return nil
+    }
+    finishSpacingToken()
+    return spacingFault ? false : nil
+  }
+
+  private func finishSpacingToken(space: Bool = false, cancel: Bool = false) {
+    guard let token = spacingToken, let client else { return }
+    spacingToken = nil
+    guard !spacingFault else { return }
+    spacingFault = !token.finish(in: client, space: space, cancel: cancel)
+  }
+
+  #if SYNTHETIC_IMK_PROBE
+  @objc private func probeOff() { probeMode = .off }
+  @objc private func probeComposed() { probeMode = .composed }
+  @objc private func probeTargeted() { probeMode = .targeted }
+  @objc private func probeRightFirst() { probeMode = .rightFirst }
+  @objc private func probeEmptyMark() { probeMode = .emptyMark }
+
+  // Numeric ranges and booleans only. Never fetch document text or log key/Rime content.
+  private func traceIMKState(_ phase: StaticString) {
+    guard let client, client.bundleIdentifier() == Self.syntheticHostID else { return }
+    let dapy = client.supportsProperty(UInt32(kTSMDocumentSupportDocumentAccessPropertyTag))
+    let rimeInputNonEmpty = session != 0 && (rimeAPI.get_input(session).map { $0.pointee != 0 } ?? false)
+    print("IMKState phase=\(phase) selected=\(client.selectedRange()) marked=\(client.markedRange()) dapy=\(dapy) rimeInputNonEmpty=\(rimeInputNonEmpty) preeditNonEmpty=\(!preedit.isEmpty)")
+  }
+
+  // Experiment only: never log document text, committed text, key characters, or app identifiers.
+  // The bundle gate prevents even a read when the test input source is selected in a real app.
+  private func probeCommit(_ text: String, passthrough: Bool) -> Bool {
+    guard probeMode != .off, let client, client.bundleIdentifier() == Self.syntheticHostID else { return false }
+    if probeMode == .rightFirst || probeMode == .emptyMark {
+      guard passthrough, text.utf16.count == 1, let character = text.first,
+            character.isASCII && (character.isLetter || character.isNumber) else { return false }
+    }
+    let access = client.supportsProperty(UInt32(kTSMDocumentSupportDocumentAccessPropertyTag))
+    let selected = client.selectedRange()
+    let marked = client.markedRange()
+    guard access, !text.isEmpty, selected.location != NSNotFound, selected.length == 0 else {
+      print("IMKProbe status=skip access=\(access) selection=\(selected)")
+      return false
+    }
+    let length = client.length()
+    guard length != NSNotFound, length >= 0 else {
+      print("IMKProbe status=skip-length selection=\(selected)")
+      return false
+    }
+    let span = marked.location == NSNotFound ? selected : marked
+    guard span.location <= length, span.length != NSNotFound, span.length <= length - span.location,
+          selected.location >= span.location, selected.location <= span.location + span.length,
+          let adjacent = probeNeighbors(client, span: span, length: length) else {
+      print("IMKProbe status=skip-neighbors selection=\(selected) marked=\(marked)")
+      return false
+    }
+    let decision = spacesAroundInsertion(text, left: adjacent.0, right: adjacent.1)
+    print("IMKProbe status=preflight selection=\(selected) marked=\(marked) before=\(decision.before) after=\(decision.after) passthrough=\(passthrough)")
+    guard client.selectedRange() == selected, client.markedRange() == marked else { return false }
+
+    if probeMode == .emptyMark {
+      guard marked.location == NSNotFound, length <= Int.max - 3 else { return false }
+      let combined = (decision.before ? " " : "") + text + (decision.after ? " " : "")
+      client.insertText(combined, replacementRange: .empty)
+      let committed = client.attributedSubstring(from: NSRange(location: selected.location, length: combined.utf16.count))
+      let contentMatch = committed?.string == combined && client.length() == length + combined.utf16.count
+      guard contentMatch, client.markedRange().location == NSNotFound else {
+        print("IMKProbe status=empty-mark-commit-unconfirmed selection=\(client.selectedRange()) marked=\(client.markedRange()) contentMatch=\(contentMatch)")
+        return true // already wrote; do not pass the key through or retry
+      }
+      // Experimental hypothesis only: IMK does not promise an empty marked
+      // string is a selection setter. Observe the result without retrying.
+      let desired = selected.location + combined.utf16.count - (decision.after ? 1 : 0)
+      client.setMarkedText("", selectionRange: NSRange(location: 0, length: 0),
+                           replacementRange: NSRange(location: desired, length: 0))
+      let actual = client.selectedRange()
+      let markedAfter = client.markedRange()
+      let textAfter = client.attributedSubstring(from: NSRange(location: selected.location, length: combined.utf16.count))
+      print("IMKProbe status=empty-mark selection=\(actual) marked=\(markedAfter) caretMatch=\(actual == NSRange(location: desired, length: 0)) markClear=\(markedAfter.location == NSNotFound) textMatch=\(textAfter?.string == combined && client.length() == length + combined.utf16.count)")
+      return true
+    }
+
+    if probeMode == .rightFirst {
+      guard marked.location == NSNotFound, length <= Int.max - 3 else { return false }
+      let insertion = NSRange(location: selected.location, length: 0)
+      if decision.after {
+        client.insertText(" ", replacementRange: insertion)
+        let spacedLength = client.length()
+        let rightSpace = client.attributedSubstring(from: NSRange(location: selected.location, length: 1))
+        guard spacedLength == length + 1, rightSpace?.length == 1, rightSpace?.string == " ",
+              client.markedRange().location == NSNotFound,
+              let neighbors = probeNeighbors(client, span: NSRange(location: selected.location, length: 1), length: spacedLength),
+              neighbors.0 == adjacent.0, neighbors.1 == adjacent.1 else {
+          print("IMKProbe status=right-first-unconfirmed selection=\(client.selectedRange())")
+          return true // space may already exist; do not pass the key through as well
+        }
+      }
+      // The targeted first write may move the host caret. Insert at the original
+      // document position; a host that ignores this range can fail this experiment.
+      let combined = (decision.before ? " " : "") + text
+      client.insertText(combined, replacementRange: insertion)
+      let afterCommit = client.selectedRange()
+      let committed = client.attributedSubstring(from: NSRange(location: selected.location, length: combined.utf16.count))
+      print("IMKProbe status=right-first selection=\(afterCommit) contentMatch=\(committed?.string == combined) caretMatch=\(afterCommit == NSRange(location: selected.location + combined.utf16.count, length: 0))")
+      return true
+    }
+
+    if probeMode == .composed {
+      let combined = (decision.before ? " " : "") + text + (decision.after ? " " : "")
+      client.insertText(combined, replacementRange: .empty)
+      print("IMKProbe status=composed selection=\(client.selectedRange())")
+      return true
+    }
+
+    client.insertText(text, replacementRange: .empty)
+    let post = client.selectedRange()
+    let postLength = client.length()
+    let units = text.utf16.count
+    guard client.markedRange().location == NSNotFound, post.length == 0,
+          post.location != NSNotFound, post.location >= units,
+          postLength != NSNotFound, post.location <= postLength,
+          let committed = client.attributedSubstring(from: NSRange(location: post.location - units, length: units)),
+          committed.length == units, committed.string == text,
+          let neighbors = probeNeighbors(client, span: NSRange(location: post.location - units, length: units), length: postLength),
+          neighbors.0 == adjacent.0, neighbors.1 == adjacent.1 else {
+      print("IMKProbe status=committed-only selection=\(post)")
+      return true // original text is already committed; do not commit twice
+    }
+
+    // Record the outcome; these are *not* an atomic transaction or an Undo guarantee.
+    if decision.after {
+      client.insertText(" ", replacementRange: NSRange(location: post.location, length: 0))
+      let result = client.attributedSubstring(from: NSRange(location: post.location, length: 1))
+      guard result?.length == 1, result?.string == " " else {
+        print("IMKProbe status=targeted-right-unconfirmed selection=\(client.selectedRange())")
+        return true
+      }
+    }
+    if decision.before {
+      client.insertText(" ", replacementRange: NSRange(location: post.location - units, length: 0))
+    }
+    print("IMKProbe status=targeted selection=\(client.selectedRange()) before=\(decision.before) after=\(decision.after)")
+    return true
+  }
+
+  private func probeNeighbors(_ client: IMKTextInput, span: NSRange, length: Int)
+    -> (Character?, Character?)? {
+    let leftCount = min(2, span.location)
+    let rightCount = min(2, length - span.location - span.length)
+    let left = NSRange(location: span.location - leftCount, length: leftCount)
+    let right = NSRange(location: span.location + span.length, length: rightCount)
+    var before: Character?
+    var after: Character?
+    if leftCount != 0 {
+      guard let substring = client.attributedSubstring(from: left), substring.length == leftCount else { return nil }
+      before = substring.string.last
+    }
+    if rightCount != 0 {
+      guard let substring = client.attributedSubstring(from: right), substring.length == rightCount else { return nil }
+      after = substring.string.first
+    }
+    return (before, after)
+  }
+  #endif
 
   @objc func deploy() {
     NSApp.squirrelAppDelegate.deploy()
@@ -351,7 +689,11 @@ private extension SquirrelInputController {
       SquirrelInputController.unknownAppCnt &+= 1
       return "UnknownApp\(SquirrelInputController.unknownAppCnt)"
     }()
+#if SYNTHETIC_IMK_PROBE
+    print("createSession: status=true")
+#else
     print("createSession: \(app)")
+#endif
     currentApp = app
     session = rimeAPI.create_session()
     schemaId = ""
@@ -367,7 +709,9 @@ private extension SquirrelInputController {
     }
     if let appOptions = NSApp.squirrelAppDelegate.config?.getAppOptions(currentApp) {
       for (key, value) in appOptions {
+#if !SYNTHETIC_IMK_PROBE
         print("set app option: \(key) = \(value)")
+#endif
         rimeAPI.set_option(session, key, value)
       }
     }
@@ -439,7 +783,9 @@ private extension SquirrelInputController {
   // swiftlint:disable:next cyclomatic_complexity
   func rimeUpdate() {
     // print("[DEBUG] rimeUpdate")
+    if spacingToken != nil || spacingFault { return }
     rimeConsumeCommittedText()
+    if spacingFault { return }
 
     var status = RimeStatus_stdbool.rimeStructInit()
     if rimeAPI.get_status(session, &status) {
@@ -558,16 +904,67 @@ private extension SquirrelInputController {
   }
 
   func commit(string: String) {
-    guard let client = client else { return }
+    guard let client = client, !spacingFault else { return }
+    if string.isEmpty { return }
     // print("[DEBUG] commitString: \(string)")
+    #if SYNTHETIC_IMK_PROBE
+    traceIMKState("beforeRimeCommit")
+    if probeCommit(string, passthrough: false) {
+      preedit = ""
+      hidePalettes()
+      traceIMKState("afterRimeCommit")
+      return
+    }
+    #endif
+    if spacingAllowed {
+      var composition: SpacingComposition?
+      let marked = client.markedRange()
+      if !preedit.isEmpty, marked.length == preedit.utf16.count,
+         client.attributedSubstring(from: marked)?.string == preedit {
+        composition = SpacingComposition(client: client, replacing: marked)
+      } else if preedit.isEmpty {
+        composition = idleSpacingComposition()
+      }
+      if var composition, composition.requiresSpacing(for: string) {
+        if !preedit.isEmpty {
+          // Remote IMK ignores replacement ranges while a mark is active.
+          // Close only the verified Rime preedit before establishing the final
+          // candidate's separator and mark. The candidate is committed once.
+          guard composition.finish(in: client, cancel: true),
+                let insertion = SpacingComposition(client: client, replacing: client.selectedRange()) else {
+            spacingFault = true
+            return
+          }
+          composition = insertion
+        }
+        spacingFault = !composition.update(string, in: client)
+        if !spacingFault { spacingFault = !composition.finish(in: client) }
+        preedit = ""
+        selRange = NSRange(location: 0, length: 0)
+        caretPos = 0
+        hidePalettes()
+        return
+      }
+    }
     client.insertText(string, replacementRange: .empty)
     preedit = ""
     hidePalettes()
+    #if SYNTHETIC_IMK_PROBE
+    traceIMKState("afterRimeCommit")
+    #endif
   }
 
   func show(preedit: String, selRange: NSRange, caretPos: Int) {
     guard let client = client else { return }
     // print("[DEBUG] showPreeditString: '\(preedit)'")
+    // An idle ASCII pass-through must not start an empty Cocoa composition.
+    // Even though hasMarkedText remains false, that empty mark can change the
+    // Undo baseline of the next real composition.
+    if preedit.isEmpty && self.preedit.isEmpty {
+      self.caretPos = caretPos
+      self.selRange = selRange
+      return
+    }
     if self.preedit == preedit && self.caretPos == caretPos && self.selRange == selRange {
       return
     }
@@ -586,7 +983,13 @@ private extension SquirrelInputController {
     let remainingRange = NSRange(location: start, length: preedit.utf16.count - start)
     let attrs = mark(forStyle: kTSMHiliteSelectedRawText, at: remainingRange)! as! [NSAttributedString.Key: Any]
     attrString.setAttributes(attrs, range: remainingRange)
+    #if SYNTHETIC_IMK_PROBE
+    traceIMKState("beforeRimeMark")
+    #endif
     client.setMarkedText(attrString, selectionRange: NSRange(location: caretPos, length: 0), replacementRange: .empty)
+    #if SYNTHETIC_IMK_PROBE
+    traceIMKState("afterRimeMark")
+    #endif
   }
 
   // swiftlint:disable:next function_parameter_count
