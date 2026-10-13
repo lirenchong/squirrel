@@ -205,12 +205,13 @@ struct SquirrelApp {
         let failed = menu(0)
         check(!failed.items.last!.isEnabled && failed.items[0].isEnabled && controller.candidateRestorationResult == "invalid_payload",
               "reject public response \(fault), deletion remains available")
+        if fault == "tail" { snapshot("invalid-payload") }
         api.set_property(session, "suppression_action", "sentinel")
         restore(valid, code: "xing", text: "行")
         check(controller.candidateRestorationResult == "stale_target" && property("suppression_action") == "sentinel" && (try! Data(contentsOf: canonical)) == Data(source.utf8),
               "\(fault) does not restore stale snapshot")
       }
-      snapshot("invalid-payload")
+      snapshot("stale-snapshot")
       api.set_property(session, "panel_wire_fault", "")
       let fresh = restoreMenu(menu(0))
       restore(fresh, code: "lü%", text: "百分%09号")
