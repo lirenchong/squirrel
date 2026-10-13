@@ -37,6 +37,9 @@ final class SquirrelInputController: IMKInputController {
   private static let controllers = NSHashTable<SquirrelInputController>.weakObjects()
   private var spacingToken: SpacingComposition?
   private var spacingFault = false
+  #if SYNTHETIC_IMK_PROBE && SYNTHETIC_SPACING_P
+  private var pendingSpacingSeparator: SpacingComposition?
+  #endif
   #if SYNTHETIC_IMK_PROBE
   private enum ProbeMode { case off, composed, targeted, rightFirst, emptyMark }
   private var probeMode: ProbeMode = .off
@@ -282,6 +285,9 @@ final class SquirrelInputController: IMKInputController {
     // print("[DEBUG] deactivateServer: \(sender ?? "nil")")
     hidePalettes()
     commitComposition(sender)
+    #if SYNTHETIC_IMK_PROBE && SYNTHETIC_SPACING_P
+    settleSpacingSeparator()
+    #endif
     client = nil
     spacingFault = false
   }
@@ -303,6 +309,12 @@ final class SquirrelInputController: IMKInputController {
    */
   override func commitComposition(_ sender: Any!) {
     self.client ?= sender as? IMKTextInput
+    #if SYNTHETIC_IMK_PROBE && SYNTHETIC_SPACING_P
+    if pendingSpacingSeparator != nil {
+      settleSpacingSeparator()
+      return
+    }
+    #endif
     if spacingToken != nil {
       finishSpacingToken()
       return
@@ -370,7 +382,12 @@ final class SquirrelInputController: IMKInputController {
   }
 
   @objc func toggleAutoSpacing() {
-    for controller in Self.controllers.allObjects { controller.finishSpacingToken() }
+    for controller in Self.controllers.allObjects {
+      controller.finishSpacingToken()
+      #if SYNTHETIC_IMK_PROBE && SYNTHETIC_SPACING_P
+      controller.settleSpacingSeparator()
+      #endif
+    }
     Self.autoSpacing.toggle()
   }
 
@@ -413,6 +430,15 @@ final class SquirrelInputController: IMKInputController {
   // nil continues normal Rime routing, false passes straight to the host.
   private func handleSpacingKey(_ event: NSEvent) -> Bool? {
     if spacingFault { return false }
+    #if SYNTHETIC_IMK_PROBE && SYNTHETIC_SPACING_P
+    if pendingSpacingSeparator != nil {
+      let nextInsertion = event.modifierFlags.isSubset(of: [.shift, .capsLock]) &&
+        event.characters?.unicodeScalars.allSatisfy { (0x21...0x7E).contains($0.value) } == true
+      settleSpacingSeparator(forNextInsertion: nextInsertion)
+      if spacingFault { return false }
+      if event.keyCode == 49 { return true }
+    }
+    #endif
     guard let token = spacingToken, let client else { return nil }
     guard token.isCurrent(in: client) else {
       spacingToken = nil
@@ -449,7 +475,19 @@ final class SquirrelInputController: IMKInputController {
     spacingToken = nil
     guard !spacingFault else { return }
     spacingFault = !token.finish(in: client, space: space, cancel: cancel)
+    #if SYNTHETIC_IMK_PROBE && SYNTHETIC_SPACING_P
+    if !spacingFault && token.hasPendingSeparator { pendingSpacingSeparator = token }
+    #endif
   }
+
+  #if SYNTHETIC_IMK_PROBE && SYNTHETIC_SPACING_P
+  private func settleSpacingSeparator(forNextInsertion: Bool = false) {
+    guard let pending = pendingSpacingSeparator, let client else { return }
+    pendingSpacingSeparator = nil
+    guard !spacingFault else { return }
+    spacingFault = !pending.settlePendingSeparator(in: client, forNextInsertion: forNextInsertion)
+  }
+  #endif
 
   #if SYNTHETIC_IMK_PROBE
   @objc private func probeOff() { probeMode = .off }
@@ -926,7 +964,7 @@ private extension SquirrelInputController {
         composition = idleSpacingComposition()
       }
       if var composition, composition.requiresSpacing(for: string) {
-        #if !(SYNTHETIC_IMK_PROBE && SYNTHETIC_SPACING_L)
+        #if !(SYNTHETIC_IMK_PROBE && (SYNTHETIC_SPACING_L || SYNTHETIC_SPACING_P))
         if !preedit.isEmpty {
           // Remote IMK ignores replacement ranges while a mark is active.
           // Close only the verified Rime preedit before establishing the final
@@ -941,6 +979,9 @@ private extension SquirrelInputController {
         #endif
         spacingFault = !composition.update(string, in: client)
         if !spacingFault { spacingFault = !composition.finish(in: client) }
+        #if SYNTHETIC_IMK_PROBE && SYNTHETIC_SPACING_P
+        if !spacingFault && composition.hasPendingSeparator { pendingSpacingSeparator = composition }
+        #endif
         preedit = ""
         selRange = NSRange(location: 0, length: 0)
         caretPos = 0

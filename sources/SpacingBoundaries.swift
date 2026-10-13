@@ -56,6 +56,9 @@ final class SpacingComposition {
   private var outsideSuffix = false
   private let before: String
   private let after: String
+  #if SYNTHETIC_IMK_PROBE && SYNTHETIC_SPACING_P
+  private(set) var hasPendingSeparator = false
+  #endif
 
   init?(client: IMKTextInput, replacing range: NSRange) {
     let length = client.length()
@@ -160,6 +163,7 @@ final class SpacingComposition {
     let suffix = self.suffix ?? (spaces.after ? " " : "")
     #endif
     var replacement = firstUpdate ? range : NSRange.empty
+    #if !(SYNTHETIC_IMK_PROBE && SYNTHETIC_SPACING_P)
     if firstUpdate && range.length == 0 && !suffix.isEmpty {
       // This writes only the owned separator, never an English/numeric token.
       // The first token event must include both operations in one Undo group.
@@ -173,6 +177,7 @@ final class SpacingComposition {
       outsideSuffix = true
       replacement = NSRange(location: range.location, length: 0)
     }
+    #endif
     let transportAnchor = firstUpdate ? selection.location : marked.location
     let next = prefix + suffix
     self.text = text
@@ -206,6 +211,37 @@ final class SpacingComposition {
   @discardableResult
   func finish(in client: IMKTextInput, space: Bool = false, cancel: Bool = false) -> Bool {
     guard isCurrent(in: client) else { return false }
+    #if SYNTHETIC_IMK_PROBE && SYNTHETIC_SPACING_P
+    // P hypothesis: commit the core, then leave only its right separator in a
+    // new mark with selection at zero. This is a deferred transaction, NOT a
+    // completed insertion. No host-only unmark/selection/Undo APIs are used.
+    let spaces = spacesAroundInsertion(text, left: before.last, right: after.first)
+    let core = cancel ? "" : (spaces.before ? " " : "") + text
+    let pending = !cancel && (spaces.after || space) ? " " : ""
+    if cancel {
+      client.setMarkedText(NSAttributedString(string: ""), selectionRange: NSRange(location: 0, length: 0),
+                           replacementRange: .empty)
+    } else {
+      client.insertText(core, replacementRange: .empty)
+    }
+    documentLength += core.utf16.count - range.length
+    range.length = core.utf16.count
+    rendered = core
+    selection = NSRange(location: NSMaxRange(range), length: 0)
+    marked = client.markedRange()
+    guard (marked.location == NSNotFound || marked.length == 0), isCurrent(in: client) else { return false }
+    if !pending.isEmpty {
+      client.setMarkedText(NSAttributedString(string: pending), selectionRange: NSRange(location: 0, length: 0),
+                           replacementRange: selection)
+      rendered += pending
+      range.length += pending.utf16.count
+      documentLength += pending.utf16.count
+      marked = NSRange(location: selection.location, length: pending.utf16.count)
+      hasPendingSeparator = true
+    }
+    self.suffix = pending
+    return isCurrent(in: client)
+    #else
     #if SYNTHETIC_IMK_PROBE && SYNTHETIC_SPACING_L
     let spaces = (before: spacesAroundInsertion(text, left: before.last, right: after.first).before, after: false)
     #else
@@ -262,5 +298,33 @@ final class SpacingComposition {
       (result.isEmpty || client.attributedSubstring(from: resultRange)?.string == result) &&
       (before.isEmpty || client.attributedSubstring(from: left)?.string == before) &&
       (after.isEmpty || client.attributedSubstring(from: right)?.string == after)
+    #endif
   }
+
+  #if SYNTHETIC_IMK_PROBE && SYNTHETIC_SPACING_P
+  func settlePendingSeparator(in client: IMKTextInput, forNextInsertion: Bool) -> Bool {
+    guard hasPendingSeparator, isCurrent(in: client) else { return false }
+    let tokenTail = selection
+    let pending = suffix ?? ""
+    if forNextInsertion {
+      // The next token supplies its left separator; do not commit the pending
+      // separator separately. Still test the next token's actual Undo history.
+      client.setMarkedText(NSAttributedString(string: ""), selectionRange: NSRange(location: 0, length: 0),
+                           replacementRange: .empty)
+      rendered = String(rendered.dropLast(pending.count))
+      range.length -= pending.utf16.count
+      documentLength -= pending.utf16.count
+    } else {
+      client.insertText(pending, replacementRange: .empty)
+    }
+    marked = client.markedRange()
+    hasPendingSeparator = false
+    let caretMatches = client.selectedRange() == tokenTail
+    Logger(subsystem: Bundle.main.bundleIdentifier ?? "SquirrelTests", category: "lifecycle")
+      .notice("pendingSettled next=\(forNextInsertion) caretMatches=\(caretMatches) expected=\(tokenTail.location) actual=\(client.selectedRange().location)")
+    // A closing transaction that moves the caret is rejected, not repaired by
+    // a second mark, synthetic arrow, or host-side selection setter.
+    return isCurrent(in: client) && (marked.location == NSNotFound || marked.length == 0) && caretMatches
+  }
+  #endif
 }

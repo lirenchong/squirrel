@@ -9,8 +9,7 @@ final class SyntheticWebFixture: NSObject, WKNavigationDelegate {
   private var initialNavigation = true
   private var deniedNavigation = false
   private var finished = false
-  private let output = Bundle.main.bundleURL.deletingLastPathComponent()
-    .deletingLastPathComponent().deletingLastPathComponent()
+  private let output = SyntheticTextHost.workspaceRoot
     .appendingPathComponent(".amp/in/artifacts/browser-fixture.png")
 
   override init() {

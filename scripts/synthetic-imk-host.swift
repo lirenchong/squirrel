@@ -32,6 +32,32 @@ private final class SyntheticTextView: NSTextView {
 
 @main
 struct SyntheticTextHost {
+  static var workspaceRoot: URL {
+    let parent = Bundle.main.bundleURL.deletingLastPathComponent()
+    let build = ["baseline", "L", "P"].contains(parent.lastPathComponent) ? parent.deletingLastPathComponent() : parent
+    return build.deletingLastPathComponent().deletingLastPathComponent()
+  }
+  private static var experimentReceipt: [String: Any] = [:]
+  private static func argument(_ name: String) -> String? {
+    guard let index = CommandLine.arguments.firstIndex(of: name), index + 1 < CommandLine.arguments.count else { return nil }
+    return CommandLine.arguments[index + 1]
+  }
+  private static func saveExperimentReceipt() {
+    guard let run = argument("--run-id"), UUID(uuidString: run) != nil else { return }
+    // The offline builder places this app at build/synthetic-imk-probe/VARIANT.
+    let directory = workspaceRoot.appendingPathComponent(".amp/in/artifacts")
+    guard directory.resolvingSymlinksInPath() == directory.standardizedFileURL,
+          FileManager.default.fileExists(atPath: directory.path) else { return }
+    let output = directory.appendingPathComponent("remote-\(run).json")
+    guard output.resolvingSymlinksInPath() == output.standardizedFileURL else { return }
+    experimentReceipt["runID"] = run
+    experimentReceipt["case"] = argument("--experiment-case")
+    experimentReceipt["evidence"] = "remote-synthetic-NSTextView"
+    if let data = try? JSONSerialization.data(withJSONObject: experimentReceipt, options: [.prettyPrinted, .sortedKeys]) {
+      try? data.write(to: output, options: .atomic)
+    }
+  }
+
   static func main() {
     let app = NSApplication.shared
     let background = CommandLine.arguments.contains("--background")
@@ -99,7 +125,17 @@ struct SyntheticTextHost {
               context.selectedKeyboardInputSource = original
               Logger(subsystem: "com.example.SquirrelSyntheticTextHost", category: "fixture")
                 .notice("focusTestRestored=\(context.selectedKeyboardInputSource == original)")
+              experimentReceipt["restored"] = context.selectedKeyboardInputSource == original
               app.hide(nil)
+            } else {
+              // Never override an external focus/source change. The verifier
+              // treats this as incomplete rollback, not successful restoration.
+              experimentReceipt["restored"] = false
+              experimentReceipt["restoreSkippedExternalChange"] = true
+            }
+            if argument("--experiment-case") != nil {
+              saveExperimentReceipt()
+              app.terminate(nil)
             }
           }
         } else {
@@ -170,6 +206,69 @@ struct SyntheticTextHost {
     view.inserts = 0
     view.separatorInserts = 0
     Task { @MainActor in
+      if let experiment = argument("--experiment-case") {
+        // One independent case per fresh, default-off IME process. On a failed
+        // observation no further IMK key writes are sent; Undo and restoration
+        // are measured separately and are never used to relax the assertion.
+        let chinese = experiment == "chinese"
+        let original = chinese ? "x7" : (experiment == "line-end" ? "甲" : "甲乙")
+        view.string = original
+        view.setSelectedRange(NSRange(location: 1, length: 0))
+        view.undoManager?.removeAllActions()
+        experimentReceipt = ["complete": false, "restored": false, "userMoved": false]
+        experimentReceipt["scope"] = experiment == "click" || experiment == "arrow" ? "user-movement" : "unmoved-completion"
+        saveExperimentReceipt()
+        guard ready(), send(1, flags: [.maskControl, .maskAlternate]) else { return }
+        if chinese {
+          _ = send(56, flags: [.maskShift], type: .flagsChanged)
+          _ = send(56, type: .flagsChanged)
+        }
+        let codes: [CGKeyCode] = chinese ? [38, 34, 0] : (experiment == "line-end" || experiment == "right-Han" ? [0, 11, 19] : [0])
+        for code in codes {
+          try? await Task.sleep(nanoseconds: 100_000_000)
+          guard ready(), send(code) else { return }
+        }
+        try? await Task.sleep(nanoseconds: 100_000_000)
+        guard ready() else { return }
+        switch experiment {
+        case "chinese", "space": _ = send(49)
+        case "blur": _ = window.makeFirstResponder(nil)
+        case "arrow":
+          _ = send(123)
+          experimentReceipt["userMoved"] = true
+        case "click":
+          view.setSelectedRange(NSRange(location: 0, length: 0))
+          _ = window.makeFirstResponder(nil)
+          experimentReceipt["userMoved"] = true
+        default: _ = send(1, flags: [.maskControl, .maskAlternate])
+        }
+        try? await Task.sleep(nanoseconds: 100_000_000)
+        guard NSApp.isActive, window.isKeyWindow, context.selectedKeyboardInputSource == expected else { return }
+        let expectedText = chinese ? "x 甲 7" : (experiment == "line-end" ? "甲 ab2" : (experiment == "right-Han" ? "甲 ab2 乙" : "甲 a 乙"))
+        let tokenTail = chinese ? 3 : (codes.count == 3 ? 5 : 3)
+        let expectedCaret = experiment == "click" ? 0 : (experiment == "arrow" ? tokenTail - 1 : tokenTail)
+        let textMatches = view.string == expectedText
+        let caretMatches = view.selectedRange() == NSRange(location: expectedCaret, length: 0)
+        let markClear = !view.hasMarkedText()
+        experimentReceipt["textMatches"] = textMatches
+        experimentReceipt["caretMatches"] = caretMatches
+        experimentReceipt["markClear"] = markClear
+        experimentReceipt["actualCaret"] = view.selectedRange().location
+        experimentReceipt["expectedCaret"] = expectedCaret
+        experimentReceipt["beforeUndoMarkLength"] = view.markedRange().length
+        experimentReceipt["eventBoundary"] = view.undoManager?.groupingLevel == 0
+        // Host-native Undo only. No manually opened groups or IME Undo API.
+        view.undoManager?.undo()
+        let undoMatches = view.string == original && view.selectedRange() == NSRange(location: 1, length: 0) && !view.hasMarkedText()
+        experimentReceipt["oneUndoMatches"] = undoMatches
+        experimentReceipt["undoRemaining"] = view.undoManager?.canUndo == true
+        experimentReceipt["complete"] = true
+        experimentReceipt["pass"] = textMatches && caretMatches && markClear && undoMatches &&
+          view.undoManager?.canUndo == false && experimentReceipt["eventBoundary"] as? Bool == true
+        saveExperimentReceipt()
+        _ = verify(experimentReceipt["pass"] as? Bool == true, "experimentComplete")
+        return
+      }
       if !CommandLine.arguments.contains("--chinese-only") {
         guard verify(send(1, flags: [.maskControl, .maskAlternate]), "enable") else { return }
         for (code, text, caret) in [
@@ -190,9 +289,7 @@ struct SyntheticTextHost {
           // Render only this fixture's own view; no screen-capture permission or
           // pixels from another application are involved.
           view.cacheDisplay(in: view.bounds, to: image)
-          let root = Bundle.main.bundleURL.deletingLastPathComponent().deletingLastPathComponent()
-            .deletingLastPathComponent()
-          let path = root.appendingPathComponent(".amp/in/artifacts/spacing-token.png")
+          let path = workspaceRoot.appendingPathComponent(".amp/in/artifacts/spacing-token.png")
           if let data = image.representation(using: .png, properties: [:]) {
             try? data.write(to: path, options: .atomic)
           }

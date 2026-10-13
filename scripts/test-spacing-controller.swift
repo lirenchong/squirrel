@@ -21,6 +21,7 @@ private final class CocoaClient: NSObject, IMKTextInput {
   var tokenCommits = 0
   var separatorInserts = 0
   var marks = 0
+  var boundaryReads = 0
   var documentAccess = true
   var dropsCommit = false
   var traceUndo = false
@@ -54,6 +55,7 @@ private final class CocoaClient: NSObject, IMKTextInput {
   func selectedRange() -> NSRange { view.selectedRange() }
   func markedRange() -> NSRange { view.markedRange() }
   func attributedSubstring(from range: NSRange) -> NSAttributedString? {
+    boundaryReads += 1
     var actual = NSRange(location: NSNotFound, length: 0)
     let result = view.attributedSubstring(forProposedRange: range, actualRange: &actual)
     return actual == range ? result : nil
@@ -74,7 +76,8 @@ private final class CocoaClient: NSObject, IMKTextInput {
   func supportsProperty(_ property: TSMDocumentPropertyTag) -> Bool { documentAccess }
   func uniqueClientIdentifierString() -> String? { "synthetic-controller-unit" }
   func string(from range: NSRange, actualRange: NSRangePointer?) -> String? {
-    view.attributedSubstring(forProposedRange: range, actualRange: actualRange)?.string
+    boundaryReads += 1
+    return view.attributedSubstring(forProposedRange: range, actualRange: actualRange)?.string
   }
   func firstRect(forCharacterRange range: NSRange, actualRange: NSRangePointer?) -> NSRect {
     actualRange?.pointee = range
@@ -123,7 +126,7 @@ struct SquirrelApp {
             client.view.hasMarkedText() == marked, label)
     }
 
-    #if SYNTHETIC_SPACING_L
+    #if SYNTHETIC_SPACING_L || SYNTHETIC_SPACING_P
     // Strict experiment oracle. Never accept missing right spacing, a pending
     // mark, a caret after the right space, or two Undos as completion.
     do {
@@ -139,6 +142,7 @@ struct SquirrelApp {
       ("right-Han", "甲乙", 1, "ab2", "甲 ab2 乙", 5, "commit"),
       ("Space", "甲乙", 1, "a", "甲 a 乙", 3, "space"),
       ("Enter", "甲乙", 1, "42", "甲 42 乙", 4, "enter"),
+      ("arrow-before-host-move", "甲乙", 1, "a", "甲 a 乙", 3, "arrow"),
       ("punctuation", "甲乙", 1, "a,", "甲 a,乙", 4, "commit"),
       ("blur-unmoved", "甲乙", 1, "a", "甲 a 乙", 3, "blur"),
       ("existing-space", "甲 乙", 2, "a", "甲 a 乙", 3, "commit")
@@ -152,6 +156,7 @@ struct SquirrelApp {
       switch ending {
       case "space": key(" ", 49, edgeInput, edge)
       case "enter": _ = key("\r", 36, edgeInput, edge) // Observe completion before host inserts newline.
+      case "arrow": _ = key("\u{f702}", 123, edgeInput, edge) // Before host performs the user's move.
       case "blur": edgeInput.deactivateServer(edge)
       default: edgeInput.commitComposition(edge)
       }
@@ -193,6 +198,26 @@ struct SquirrelApp {
     state(continuous, "甲 42 甲", 6, false, "next Chinese commit merges its left separator")
     delegate.loadSettings()
 
+    for (identity, documentAccess) in [("com.example.NotAllowed", true), ("com.example.SquirrelSyntheticTextHost", false)] {
+      let guarded = CocoaClient()
+      guarded.identity = identity
+      guarded.documentAccess = documentAccess
+      let guardedInput = controller(guarded)
+      _ = key("a", 0, guardedInput, guarded)
+      // Normal Rime may own preedit here (unknown app starts Chinese). The
+      // spacing guard forbids boundary text access and separator writes, not
+      // the existing engine's normal composition behavior.
+      check(guarded.boundaryReads == 0 && guarded.separatorInserts == 0,
+            "experiment preserves synthetic-only/document-access boundary guard")
+    }
+    let cancel = CocoaClient()
+    let cancelInput = controller(cancel)
+    key("a", 0, cancelInput, cancel)
+    key("b", 11, cancelInput, cancel)
+    key("\u{7f}", 51, cancelInput, cancel)
+    key("\u{1b}", 53, cancelInput, cancel)
+    state(cancel, "甲乙", 1, false, "experiment Backspace/Escape cancels all owned spacing")
+
     let moved = CocoaClient()
     let movedInput = controller(moved)
     key("a", 0, movedInput, moved)
@@ -201,11 +226,47 @@ struct SquirrelApp {
     movedInput.deactivateServer(moved)
     check(moved.marks + moved.inserts == writes && moved.selectedRange().location == 0,
           "user click/movement is not corrected on blur")
+    #if SYNTHETIC_SPACING_P
+    let pending = CocoaClient()
+    let pendingInput = controller(pending)
+    key("a", 0, pendingInput, pending)
+    pendingInput.commitComposition(pending)
+    receipt(pending, "P-pending-before-close")
+    check(pending.view.string == "甲 a 乙" && pending.selectedRange().location == 3 && pending.view.hasMarkedText(),
+          "P intermediate text/caret is only a pending mark, not completion")
+    RunLoop.current.run(until: Date(timeIntervalSinceNow: 0.02))
+    pendingInput.commitComposition(pending)
+    receipt(pending, "P-close-without-user-movement")
+    state(pending, "甲 a 乙", 3, false, "P completion without user movement keeps token-tail caret")
+    RunLoop.current.run(until: Date(timeIntervalSinceNow: 0.02))
+    pending.view.undoManager?.undo()
+    receipt(pending, "P-closed-oneUndo")
+    state(pending, "甲乙", 1, false, "P closed transaction: single Cocoa Undo")
+
+    let next = CocoaClient()
+    let nextInput = controller(next)
+    key("4", 21, nextInput, next)
+    nextInput.commitComposition(next)
+    key("2", 19, nextInput, next)
+    nextInput.commitComposition(next)
+    receipt(next, "P-next-insertion")
+    state(next, "甲 42 乙", 4, false, "P subsequent number does not duplicate spacing or leave a mark")
+
+    let clicked = CocoaClient()
+    let clickedInput = controller(clicked)
+    key("a", 0, clickedInput, clicked)
+    clickedInput.commitComposition(clicked)
+    clicked.view.setSelectedRange(NSRange(location: 0, length: 0))
+    let clickWrites = clicked.inserts + clicked.marks
+    clickedInput.deactivateServer(clicked)
+    check(clicked.inserts + clicked.marks == clickWrites && clicked.selectedRange().location == 0,
+          "P user-moved caret is never corrected by stale pending offsets")
+    #endif
     enableInput.toggleAutoSpacing()
     print("EXPERIMENT evidence=in-process real-host=pending failures=\(failureCount)")
     exit(failureCount == 0 ? 0 : 1)
     }
-    #endif
+    #else
 
     let client = CocoaClient()
     let input = controller(client)
@@ -401,5 +462,6 @@ struct SquirrelApp {
     guard failureCount == 0 else { fputs("FAIL controller suite; independent cases completed\n", stderr); exit(1) }
     print("PASS controller + real librime + Cocoa; remote IMK event routing remains unverified")
     withExtendedLifetime([input, editInput, otherInput, blurInput, undoInput, chineseInput, staleInput, unsupportedInput]) {}
+    #endif
   }
 }

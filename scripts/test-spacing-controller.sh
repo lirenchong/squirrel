@@ -20,7 +20,8 @@ flags=(-D SYNTHETIC_IMK_PROBE)
 case "$variant" in
   baseline) ;;
   L) flags+=(-D SYNTHETIC_SPACING_L) ;;
-  *) echo 'Expected --variant baseline|L' >&2; exit 2 ;;
+  P) flags+=(-D SYNTHETIC_SPACING_P) ;;
+  *) echo 'Expected --variant baseline|L|P' >&2; exit 2 ;;
 esac
 # Dependencies are read-only inputs; never fetch, build, or modify their tree.
 for path in Frameworks/Sparkle.framework lib/librime.1.dylib librime/src/rime_api_stdbool.h; do
@@ -53,12 +54,24 @@ swiftc -parse-as-library -enable-bare-slash-regex "${flags[@]}" -module-name Squ
 codesign --force --deep --sign - "$app"
 if $remote; then
   # Preparation only. No Xcode, LaunchServices, install, IME start or TIS calls.
-  "$root/scripts/build-synthetic-imk-probe.sh" --prepare-only
+  bash "$root/scripts/build-synthetic-imk-probe.sh" --prepare-only
   probe="$out/SquirrelSyntheticTest.app"
   host="$out/SyntheticTextHost.app"
   mkdir -p "$probe/Contents/MacOS" "$host/Contents/MacOS"
   cp "$root/build/synthetic-imk-probe/Info.plist" "$probe/Contents/Info.plist"
   cp "$root/build/synthetic-imk-probe/SyntheticTextHost-Info.plist" "$host/Contents/Info.plist"
+  python3 - "$probe/Contents/Info.plist" "$variant" <<'PY'
+import plistlib, sys
+path, variant = sys.argv[1:]
+with open(path, 'rb') as source:
+    info = plistlib.load(source)
+# The prepared plist is an Xcode template; swiftc does not expand its variables.
+info['CFBundleIdentifier'] = 'im.rime.inputmethod.Squirrel.SyntheticTest'
+info['CFBundleVersion'] = '1'
+info['SyntheticSpacingVariant'] = variant
+with open(path, 'wb') as output:
+    plistlib.dump(info, output)
+PY
   ditto "$app/Contents/Frameworks" "$probe/Contents/Frameworks"
   ditto "$app/Contents/SharedSupport" "$probe/Contents/SharedSupport"
   swiftc -parse-as-library -enable-bare-slash-regex "${flags[@]}" -module-name Squirrel \
