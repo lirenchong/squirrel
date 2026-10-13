@@ -151,7 +151,14 @@ final class SpacingComposition {
     let spaces = spacesAroundInsertion(text, left: before.last, right: after.first)
     let prefix = (spaces.before ? " " : "") + text
     let firstUpdate = suffix == nil
+    #if SYNTHETIC_IMK_PROBE && SYNTHETIC_SPACING_L
+    // L hypothesis: merge the left separator into this token; a later token
+    // can supply its own left separator. Existing right text is NOT repaired.
+    // This is intentionally not a production fallback or completed feature.
+    let suffix = ""
+    #else
     let suffix = self.suffix ?? (spaces.after ? " " : "")
+    #endif
     var replacement = firstUpdate ? range : NSRange.empty
     if firstUpdate && range.length == 0 && !suffix.isEmpty {
       // This writes only the owned separator, never an English/numeric token.
@@ -199,7 +206,11 @@ final class SpacingComposition {
   @discardableResult
   func finish(in client: IMKTextInput, space: Bool = false, cancel: Bool = false) -> Bool {
     guard isCurrent(in: client) else { return false }
+    #if SYNTHETIC_IMK_PROBE && SYNTHETIC_SPACING_L
+    let spaces = (before: spacesAroundInsertion(text, left: before.last, right: after.first).before, after: false)
+    #else
     let spaces = spacesAroundInsertion(text, left: before.last, right: after.first)
+    #endif
     var committed = cancel ? "" : (spaces.before ? " " : "") + text
     if space && !cancel { committed += " " }
     // Normal completion replaces exactly the mark. Cancellation, consuming a

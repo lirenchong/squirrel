@@ -123,6 +123,90 @@ struct SquirrelApp {
             client.view.hasMarkedText() == marked, label)
     }
 
+    #if SYNTHETIC_SPACING_L
+    // Strict experiment oracle. Never accept missing right spacing, a pending
+    // mark, a caret after the right space, or two Undos as completion.
+    do {
+    let enable = CocoaClient()
+    let enableInput = controller(enable)
+    check(enableInput.menu().items.first?.state == .off, "experiment default off")
+    enableInput.toggleAutoSpacing()
+    func receipt(_ client: CocoaClient, _ phase: String) {
+      print("EXPERIMENT phase=\(phase) text=\(String(reflecting: client.view.string)) caret=\(client.selectedRange().location) marked=\(client.markedRange()) undo=\(client.view.undoManager?.canUndo == true)")
+    }
+    for (name, original, start, token, expected, end, ending) in [
+      ("line-end", "甲", 1, "ab2", "甲 ab2", 5, "commit"),
+      ("right-Han", "甲乙", 1, "ab2", "甲 ab2 乙", 5, "commit"),
+      ("Space", "甲乙", 1, "a", "甲 a 乙", 3, "space"),
+      ("Enter", "甲乙", 1, "42", "甲 42 乙", 4, "enter"),
+      ("punctuation", "甲乙", 1, "a,", "甲 a,乙", 4, "commit"),
+      ("blur-unmoved", "甲乙", 1, "a", "甲 a 乙", 3, "blur"),
+      ("existing-space", "甲 乙", 2, "a", "甲 a 乙", 3, "commit")
+    ] {
+      let edge = CocoaClient()
+      edge.view.string = original
+      edge.view.setSelectedRange(NSRange(location: start, length: 0))
+      edge.view.undoManager?.removeAllActions()
+      let edgeInput = controller(edge)
+      for letter in token { key(String(letter), 0, edgeInput, edge) }
+      switch ending {
+      case "space": key(" ", 49, edgeInput, edge)
+      case "enter": _ = key("\r", 36, edgeInput, edge) // Observe completion before host inserts newline.
+      case "blur": edgeInput.deactivateServer(edge)
+      default: edgeInput.commitComposition(edge)
+      }
+      RunLoop.current.run(until: Date(timeIntervalSinceNow: 0.02))
+      receipt(edge, "\(name)-finish")
+      state(edge, expected, end, false, "\(name): final text + token-tail caret + no mark")
+      edge.view.undoManager?.undo()
+      receipt(edge, "\(name)-oneUndo")
+      state(edge, original, start, false, "\(name): single Cocoa Undo")
+    }
+    delegate.config = nil
+    let chinese = CocoaClient()
+    chinese.view.string = "x7"
+    chinese.view.setSelectedRange(NSRange(location: 1, length: 0))
+    chinese.view.undoManager?.removeAllActions()
+    let chineseInput = controller(chinese)
+    for (letter, code) in [("j", UInt16(38)), ("i", 34), ("a", 0)] { key(letter, code, chineseInput, chinese) }
+    check(chinese.inserts == 0 && chinese.view.hasMarkedText(), "experiment Pinyin remains Rime preedit")
+    key(" ", 49, chineseInput, chinese)
+    receipt(chinese, "Chinese-finish")
+    state(chinese, "x 甲 7", 3, false, "Chinese: final text + token-tail caret + no mark")
+    chinese.view.undoManager?.undo()
+    receipt(chinese, "Chinese-oneUndo")
+    state(chinese, "x7", 1, false, "Chinese: single Cocoa Undo")
+    delegate.loadSettings()
+
+    let continuous = CocoaClient()
+    continuous.view.string = "甲"
+    continuous.view.setSelectedRange(NSRange(location: 1, length: 0))
+    let continuousInput = controller(continuous)
+    key("4", 21, continuousInput, continuous)
+    key("2", 19, continuousInput, continuous)
+    continuousInput.commitComposition(continuous)
+    delegate.config = nil
+    let nextChineseInput = controller(continuous)
+    for (letter, code) in [("j", UInt16(38)), ("i", 34), ("a", 0)] { key(letter, code, nextChineseInput, continuous) }
+    key(" ", 49, nextChineseInput, continuous)
+    receipt(continuous, "continuous-Chinese-number-Chinese")
+    state(continuous, "甲 42 甲", 6, false, "next Chinese commit merges its left separator")
+    delegate.loadSettings()
+
+    let moved = CocoaClient()
+    let movedInput = controller(moved)
+    key("a", 0, movedInput, moved)
+    moved.view.setSelectedRange(NSRange(location: 0, length: 0))
+    let writes = moved.marks + moved.inserts
+    movedInput.deactivateServer(moved)
+    check(moved.marks + moved.inserts == writes && moved.selectedRange().location == 0,
+          "user click/movement is not corrected on blur")
+    enableInput.toggleAutoSpacing()
+    print("EXPERIMENT evidence=in-process real-host=pending failures=\(failureCount)")
+    exit(failureCount == 0 ? 0 : 1)
+    }
+    #endif
+
     let client = CocoaClient()
     let input = controller(client)
     check(input.menu().items.first?.state == .off, "spacing starts off")

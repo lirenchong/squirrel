@@ -926,6 +926,7 @@ private extension SquirrelInputController {
         composition = idleSpacingComposition()
       }
       if var composition, composition.requiresSpacing(for: string) {
+        #if !(SYNTHETIC_IMK_PROBE && SYNTHETIC_SPACING_L)
         if !preedit.isEmpty {
           // Remote IMK ignores replacement ranges while a mark is active.
           // Close only the verified Rime preedit before establishing the final
@@ -937,6 +938,7 @@ private extension SquirrelInputController {
           }
           composition = insertion
         }
+        #endif
         spacingFault = !composition.update(string, in: client)
         if !spacingFault { spacingFault = !composition.finish(in: client) }
         preedit = ""
