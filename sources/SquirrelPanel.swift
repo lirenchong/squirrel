@@ -18,6 +18,7 @@ final class SquirrelPanel: NSPanel {
 
   private var statusMessage: String = ""
   private var statusTimer: Timer?
+  private var candidateDeletionMessage = ""
 
   private var preedit: String = ""
   private var selRange: NSRange = .empty
@@ -70,6 +71,11 @@ final class SquirrelPanel: NSPanel {
   // swiftlint:disable:next cyclomatic_complexity
   override func sendEvent(_ event: NSEvent) {
     switch event.type {
+    case .rightMouseDown:
+      if let menu = candidateMenu(for: event) {
+        NSMenu.popUpContextMenu(menu, with: event, for: view)
+        return
+      }
     case .leftMouseDown:
       let (index, _, pagingUp) =  view.click(at: mousePosition())
       if let pagingUp {
@@ -147,6 +153,42 @@ final class SquirrelPanel: NSPanel {
     super.sendEvent(event)
   }
 
+  func candidateMenu(for event: NSEvent) -> NSMenu? {
+    let point = view.convert(event.locationInWindow, from: nil)
+    let (row, _, _) = view.click(at: point)
+    guard let row, let controller = inputController,
+          let target = controller.candidateDeletionTarget(index: row),
+          target.page == page, target.candidates == candidates else { return nil }
+    let menu = NSMenu()
+    menu.autoenablesItems = false
+    let item = menu.addItem(withTitle: "删除此候选", action: #selector(deleteCandidateFromMenu(_:)), keyEquivalent: "")
+    item.target = self
+    item.representedObject = target
+    item.isEnabled = controller.candidateDeletionUnavailableReason == nil
+    if !item.isEnabled {
+      menu.addItem(withTitle: "当前运行库或方案不支持候选删除", action: nil, keyEquivalent: "").isEnabled = false
+    }
+    return menu
+  }
+
+  @objc private func deleteCandidateFromMenu(_ item: NSMenuItem) {
+    guard let target = item.representedObject as? SquirrelInputController.CandidateDeletionTarget else { return }
+    inputController?.deleteCandidate(target)
+  }
+
+  func presentCandidateDeletionResult(_ result: String) {
+    switch result {
+    case "ok": candidateDeletionMessage = ""
+    case "unsupported_dictionary": candidateDeletionMessage = "未删除：此词典不支持持久身份提取"
+    case "stale_target": candidateDeletionMessage = "未删除：候选已变化，请重新右击"
+    case "storage_write_failed", "storage_replace_failed": candidateDeletionMessage = "未删除：持久存储写入失败"
+    case "unavailable", "incompatible_runtime": candidateDeletionMessage = "未删除：当前运行库或方案不支持"
+    default: candidateDeletionMessage = "未删除：\(result)"
+    }
+    update(preedit: preedit, selRange: selRange, caretPos: caretPos, candidates: candidates,
+           comments: comments, labels: labels, highlighted: index, page: page, lastPage: lastPage, update: false)
+  }
+
   func hide() {
     statusTimer?.invalidate()
     statusTimer = nil
@@ -158,6 +200,7 @@ final class SquirrelPanel: NSPanel {
   // swiftlint:disable:next cyclomatic_complexity function_parameter_count
   func update(preedit: String, selRange: NSRange, caretPos: Int, candidates: [String], comments: [String], labels: [String], highlighted index: Int, page: Int, lastPage: Bool, update: Bool) {
     if update {
+      candidateDeletionMessage = ""
       self.preedit = preedit
       self.selRange = selRange
       self.caretPos = caretPos
@@ -192,13 +235,18 @@ final class SquirrelPanel: NSPanel {
     let highlightedPreeditRange: NSRange
 
     // preedit
-    if !preedit.isEmpty {
-      preeditRange = NSRange(location: 0, length: preedit.utf16.count)
+    if !preedit.isEmpty || !candidateDeletionMessage.isEmpty {
       highlightedPreeditRange = selRange
 
-      let line = NSMutableAttributedString(string: preedit)
-      line.addAttributes(theme.preeditAttrs, range: preeditRange)
-      line.addAttributes(theme.preeditHighlightedAttrs, range: selRange)
+      let line = NSMutableAttributedString(string: preedit, attributes: theme.preeditAttrs)
+      if !preedit.isEmpty { line.addAttributes(theme.preeditHighlightedAttrs, range: selRange) }
+      if !candidateDeletionMessage.isEmpty {
+        let separator = preedit.isEmpty ? "" : "\n"
+        line.append(NSAttributedString(string: separator + candidateDeletionMessage, attributes: theme.commentAttrs))
+      }
+      // Include feedback in the existing non-candidate layout range so the
+      // panel measures it. Preedit click handling still bounds by real preedit.
+      preeditRange = NSRange(location: 0, length: line.length)
       text.append(line)
 
       text.addAttribute(.paragraphStyle, value: theme.preeditParagraphStyle, range: NSRange(location: 0, length: text.length))

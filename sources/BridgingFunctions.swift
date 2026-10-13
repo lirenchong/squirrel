@@ -18,6 +18,15 @@ extension RimeCommit: DataSizeable {}
 extension RimeStatus_stdbool: DataSizeable {}
 extension RimeModule: DataSizeable {}
 
+// RimeApi is a versioned function table. Do not dereference a newer slot just
+// because the build-time headers declare it; check the loaded table and pointer.
+func rimeAPIHasFunction<T>(_ member: KeyPath<RimeApi_stdbool, T>) -> Bool {
+  guard let api = rime_get_api_stdbool(),
+        let offset = MemoryLayout<RimeApi_stdbool>.offset(of: member),
+        Int(api.pointee.data_size) + MemoryLayout<Int32>.size >= offset + MemoryLayout<T>.size else { return false }
+  return UnsafeRawPointer(api).load(fromByteOffset: offset, as: UnsafeRawPointer?.self) != nil
+}
+
 extension DataSizeable {
   static func rimeStructInit() -> Self {
     let valuePointer = UnsafeMutablePointer<Self>.allocate(capacity: 1)

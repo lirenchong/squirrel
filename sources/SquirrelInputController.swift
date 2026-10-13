@@ -24,6 +24,24 @@ final class SquirrelInputController: IMKInputController {
   private var schemaId: String = ""
   private var inlinePreedit = false
   private var inlineCandidate = false
+  private var candidateRevision: UInt64 = 0
+  private(set) var candidateDeletionResult = ""
+
+  struct CandidateDeletionTarget: Equatable {
+    let session: RimeSessionId
+    let revision: UInt64
+    let schema: String
+    let input: String
+    let preedit: String
+    let caret: Int32
+    let page: Int32
+    let pageSize: Int32
+    let highlighted: Int32
+    let candidates: [String]
+    let comments: [String]
+    let index: Int
+  }
+
   // for chord-typing
   private var chordKeyCodes: [UInt32] = .init(repeating: 0, count: SquirrelInputController.keyRollOver)
   private var chordModifiers: [UInt32] = .init(repeating: 0, count: SquirrelInputController.keyRollOver)
@@ -137,6 +155,18 @@ final class SquirrelInputController: IMKInputController {
         if !event.isARepeat { toggleAutoSpacing() }
         return true
       }
+      // Forward Delete maps to XK_Delete. Do not rebind Control+Backspace,
+      // or pass a composing deletion through to Rime's native delete path.
+      if event.keyCode == 117 && shortcutFlags == [.control],
+         let input = rimeAPI.get_input(session), input.pointee != 0 {
+        if let target = candidateDeletionTarget(index: nil) {
+          deleteCandidate(target)
+        } else {
+          candidateDeletionResult = "unavailable"
+          NSApp.squirrelAppDelegate.panel?.presentCandidateDeletionResult(candidateDeletionResult)
+        }
+        return true
+      }
       #if SYNTHETIC_IMK_PROBE
       if client?.bundleIdentifier() == Self.syntheticHostID {
         Self.lifecycleLog.notice("keyState ascii=\(self.rimeAPI.get_option(self.session, "ascii_mode")) spacing=\(self.spacingAllowed) config=\(NSApp.squirrelAppDelegate.config?.isOpen == true) plain=\(modifiers.isSubset(of: [.shift, .capsLock]))")
@@ -194,6 +224,63 @@ final class SquirrelInputController: IMKInputController {
     }
 
     return handled
+  }
+
+  var candidateDeletionUnavailableReason: String? {
+    guard rimeAPIHasFunction(\.get_version),
+          let version = rimeAPI.get_version(), String(cString: version) == "1.16.0",
+          rimeAPIHasFunction(\.highlight_candidate_on_current_page) else { return "incompatible_runtime" }
+    guard suppressionProperty("suppression_protocol") == "1" else { return "unavailable" }
+    return nil
+  }
+
+  private func suppressionProperty(_ name: String) -> String {
+    var buffer = [CChar](repeating: 0, count: 256)
+    return rimeAPI.get_property(session, name, &buffer, buffer.count) ? String(cString: buffer) : ""
+  }
+
+  func candidateDeletionTarget(index: Int?) -> CandidateDeletionTarget? {
+    guard session != 0, rimeAPI.find_session(session) else { return nil }
+    var context = RimeContext_stdbool.rimeStructInit()
+    var status = RimeStatus_stdbool.rimeStructInit()
+    guard rimeAPI.get_context(session, &context) else { return nil }
+    defer { _ = rimeAPI.free_context(&context) }
+    guard rimeAPI.get_status(session, &status) else { return nil }
+    defer { _ = rimeAPI.free_status(&status) }
+    let row = index ?? Int(context.menu.highlighted_candidate_index)
+    guard row >= 0, row < context.menu.num_candidates, let rows = context.menu.candidates else { return nil }
+    let candidates = (0..<Int(context.menu.num_candidates)).map { String(cString: rows[$0].text) }
+    let comments = (0..<Int(context.menu.num_candidates)).map { rows[$0].comment.map { String(cString: $0) } ?? "" }
+    return CandidateDeletionTarget(session: session, revision: candidateRevision,
+      schema: status.schema_id.map { String(cString: $0) } ?? "",
+      input: rimeAPI.get_input(session).map { String(cString: $0) } ?? "",
+      preedit: context.composition.preedit.map { String(cString: $0) } ?? "",
+      caret: context.composition.cursor_pos, page: context.menu.page_no, pageSize: context.menu.page_size,
+      highlighted: context.menu.highlighted_candidate_index, candidates: candidates, comments: comments, index: row)
+  }
+
+  func deleteCandidate(_ target: CandidateDeletionTarget) {
+    if target != candidateDeletionTarget(index: target.index) {
+      candidateDeletionResult = "stale_target"
+    } else if let reason = candidateDeletionUnavailableReason {
+      candidateDeletionResult = reason
+    } else {
+      // False can mean an unchanged highlight. Verify actual selection, not
+      // the mutation Bool, without selecting/committing the candidate.
+      _ = rimeAPI.highlight_candidate_on_current_page(session, target.index)
+      if candidateDeletionTarget(index: target.index)?.highlighted != Int32(target.index) {
+        candidateDeletionResult = "highlight_failed"
+      } else {
+        rimeAPI.set_property(session, "suppression_result", "")
+        rimeAPI.set_property(session, "suppression_action", "delete")
+        _ = rimeAPI.process_key(session, 65481, 12)
+        let result = suppressionProperty("suppression_result")
+        candidateDeletionResult = result.isEmpty ? "unconfirmed" : result
+      }
+    }
+    // Refresh from the engine even on failure. A consumed key is not success.
+    rimeUpdate()
+    NSApp.squirrelAppDelegate.panel?.presentCandidateDeletionResult(candidateDeletionResult)
   }
 
   func selectCandidate(_ index: Int) -> Bool {
@@ -821,6 +908,7 @@ private extension SquirrelInputController {
   // swiftlint:disable:next cyclomatic_complexity
   func rimeUpdate() {
     // print("[DEBUG] rimeUpdate")
+    candidateRevision &+= 1
     if spacingToken != nil || spacingFault { return }
     rimeConsumeCommittedText()
     if spacingFault { return }
