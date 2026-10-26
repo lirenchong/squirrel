@@ -8,7 +8,9 @@ runtime="${RIME_RUNTIME:-/Library/Input Methods/Squirrel.app/Contents/Frameworks
 mode="${1:-normal}"
 case "$mode" in normal|page|failure|mismatch|unsupported|restore|restore-large|restore-wire|restore-old|restore-learning|restore-page|rc-reading|rc-page|rc-unicode|rc-missing) ;; *) exit 2 ;; esac
 # Test-source fixed point, not a production runtime/version gate.
-[[ "$(git -C "$owner" rev-parse HEAD)" == ed272d0d81838a5cfebac86f41c8462cd949b5f2 &&
+owner_head="$(git -C "$owner" rev-parse HEAD)"
+[[ ( "$owner_head" == ed272d0d81838a5cfebac86f41c8462cd949b5f2 ||
+     "$owner_head" == 770080fefea296b66fe5e6dc3d3d73016eb5eee7 ) &&
    -z "$(git -C "$owner" status --porcelain)" ]] || { echo 'Wrong or dirty suppression pairing' >&2; exit 2; }
 mkdir -p "$root/.amp/in"
 out="$(mktemp -d "$root/.amp/in/panel-$mode.XXXXXX")"
